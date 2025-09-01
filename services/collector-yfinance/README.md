@@ -272,3 +272,4 @@ This project is part of the FinBase - The Open Ledger initiative, dedicated to d
 **Happy Trading! 📈**
 
 *Built with ❤️ for the open financial data community*
+

@@ -1,114 +1,112 @@
 
 ---
 
+### 1. Global `README.md` (For the project root)
+
 ```markdown
 # FinBase - The Open Ledger
+## The Open-Source Financial Database for Everyone
 
-
-<!-- Replace the URL above with your final logo URL when you have it -->
-
-**Mission: To build the first open, collaborative, and free global database of financial assets, democratizing access to high-quality information.**
-
-[![Estado del Proyecto](https://img.shields.io/badge/estado-en%20desarrollo-green.svg)](https://github.com/AmericoGarciaG/FinBase)
-[![Licencia](https://img.shields.io/badge/licencia-MIT-blue.svg)](./LICENSE)
-[![GitHub Issues](https://img.shields.io/github/issues/AmericoGarciaG/FinBase.svg)](https://github.com/AmericoGarciaG/FinBase)
+[![Status](https://img.shields.io/badge/Status-In%20Development-green)](https://github.com/AmericoGarciaG/FinBase)
+[![License](https://img.shields.io/badge/License-MIT-blue)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.11+-blue)](https://python.org)
+[![Docker](https://img.shields.io/badge/Docker-Ready-informational)](https://docker.com)
 
 
 ---
 
-## Manifesto: The Open Financial Database
+## 🚀 Our Mission: Democratizing Financial Data
 
-We believe that financial knowledge should not be restricted to a select few. Information is power, and access to it defines who can innovate, research, and shape the future of finance.
+**FinBase** is an ambitious open-source initiative to build the world's first global, collaborative, and free financial asset database. We are creating a foundational layer of high-quality, accessible data to empower researchers, developers, and independent traders everywhere.
 
-Today, existing open sources—like Yahoo Finance and other free databases—are limited, incomplete, and unreliable. And premium sources, while powerful, are reserved for those who can afford prohibitive prices. This creates an unfair gap between those who have access to quality data and those who do not.
+## ✨ Core Principles
 
-**We want to change that.**
+| Principle | Description |
+|-----------|-------------|
+| **Open & Free Access** | Financial data available to everyone, without paywalls or closed barriers. |
+| **Community Driven** | A project built by the community, for the community. |
+| **Quality & Transparency**| High standards for data validation, cleaning, and traceability. |
+| **Scalable Architecture** | A solid technological foundation designed to grow with demand. |
+| **Constant Evolution** | From using third-party data to becoming a primary, reliable source. |
 
-### Our Vision
+## ⚡ Quick Start
 
-To build the first global, open, and collaborative financial asset database, designed to be free, scalable, and universally accessible. A living, transparent space that will, over time, become the trusted reference for financial information, available to researchers, developers, independent traders, students, and curious minds from all over the world.
+```bash
+# 1. Clone the repository
+git clone https://github.com/AmericoGarciaG/FinBase.git
+cd finbase
 
-### Our Commitment
+# 2. Navigate to a specific service to run it
+cd services/collector-yfinance
 
--   **Free and Open Access:** Financial data available to everyone, without paywalls or closed barriers.
--   **Quality and Transparency:** High standards for data validation and traceability.
--   **Community Collaboration:** A project built by the community, for the community.
--   **Organic Scalability:** A solid technological architecture that will grow with demand.
--   **Constant Evolution:** From using third-party data to becoming a primary, direct, and reliable source.
+# 3. Follow the instructions in the service's README to launch it
+docker compose up --build
+```
 
----
+## 🧠 System Architecture
 
-## 🏗️ System Architecture
+FinBase is built on a decoupled microservices architecture, where each component is an independent, replaceable, and scalable building block communicating via a message bus.
 
-FinBase is built on a decoupled microservices architecture, with components communicating via a message bus (RabbitMQ). This design ensures that each component is independent, replaceable, and scalable.
+### High-Level Data Flow
 
 ```
 [Data Sources] -> [Collectors] -> [Raw Data Queue] -> [Quality Service] -> [Clean Data Queue] -> [Storage Service] -> [Database] -> [API] -> [Users]
 ```
 
-The project itself is a laboratory to discover the most efficient, optimal, and cutting-edge way to store, control, access, and extract financial information with minimal resources.
+## 📦 Microservices Ecosystem
 
-## 📦 Microservices
+This monorepo contains all microservices that power the FinBase ecosystem.
 
-This repository contains all the microservices that make up the FinBase ecosystem. Each service resides in its own folder within the `/services` directory.
+| Service | Status | Description |
+|---------|--------|-------------|
+| **[`collector-yfinance`](services/collector-yfinance)** | ✅ **Active** | Production-ready data collector for Yahoo Finance. |
+| **[`quality-service`](services/quality-service)** | ✅ **Active** | The gatekeeper for data integrity and validation. |
+| **`storage-service`** | 🚧 **In Development** | Persists clean data into the TimescaleDB database. |
+| **`api-service`** | 📝 **Planned** | Exposes the data via a high-performance REST/WebSocket API. |
 
-| Service                                                      | Language | Description                                 | Status              |
-| :----------------------------------------------------------- | :------- | :------------------------------------------ | :------------------ |
-| [`services/collector-yfinance`](./services/collector-yfinance) | Python   | Data collector for Yahoo Finance.           | ✅ **Active**       |
-| `services/quality-service`                                   | Python   | Data validator and cleaner.                 | 🚧 In Development |
-| `services/storage-service`                                   | Python   | Storage service for TimescaleDB.            | 📝 Planned        |
-| `services/api-service`                                       | Python   | REST/WebSocket API for data access.         | 📝 Planned        |
+## 🔧 Tech Stack
 
-## ⚡ Quick Start Guide
+- **Core Language**: Python 3.11+
+- **Containerization**: Docker & Docker Compose
+- **Message Bus**: RabbitMQ
+- **Database**: TimescaleDB (PostgreSQL for time-series)
+- **API Framework**: FastAPI (Planned)
 
-### Prerequisites
+## 🗺️ Project Roadmap
 
--   [Git](https://git-scm.com/)
--   [Docker](https://www.docker.com/) & [Docker Compose](https://docs.docker.com/compose/)
+1.  **Phase 1: Data Ingestion & Quality (Current)**
+    -   Develop multiple collectors for different sources.
+    -   Build a robust, extensible data quality service.
 
-### 1. Clone the Repository
+2.  **Phase 2: Storage & Access**
+    -   Implement the storage service for efficient data persistence.
+    -   Develop a high-performance API for data retrieval.
 
-```bash
-git clone https://github.com/AmericoGarciaG/FinBase.git
-cd finbase
-```
-
-### 2. Run an Individual Service
-
-Each microservice can be run independently for development and testing. For example, to launch the Yahoo Finance collector:
-
-```bash
-# Navigate to the service's directory
-cd services/collector-yfinance
-
-# Create your .env file from the example
-cp .env.example .env
-
-# (Optional) Edit the .env file to change tickers or the fetch interval
-
-# Launch the service and its dependency (RabbitMQ)
-docker compose up --build
-```
-For more details, please refer to the `README.md` file inside each service's directory.
-
-*(A root `docker-compose.yml` file will be added later to orchestrate the entire system with a single command.)*
+3.  **Phase 3: Community & Expansion**
+    -   Create tools and libraries for easy data consumption.
+    -   Establish partnerships to become a primary data source.
 
 ## 🤝 How to Contribute
 
-This project is yours too! We need creative minds, technical contributions, fresh ideas, and allies who believe in our mission.
+We need creative minds, technical contributions, and allies who believe in our mission!
 
-1.  **Explore the Issues:** The best place to start is our [Issues board](https://github.com/AmericoGarciaG/FinBase/issues). Look for labels like `good first issue` or `help wanted`.
-2.  **Start a Discussion:** If you have an idea or a question, open a [Discussion](https://github.com/AmericoGarciaG/FinBase/discussions).
-3.  **Submit a Pull Request:**
-    -   Fork the repository.
-    -   Create a new branch for your feature (`git checkout -b feature/feature-name`).
-    -   Make your changes and commit them (`git commit -m 'feat: Add some amazing feature'`).
-    -   Push your branch (`git push origin feature/feature-name`).
-    -   Open a Pull Request.
+1.  **Fork** the repository.
+2.  **Create** a feature branch (`git checkout -b feature/amazing-feature`).
+3.  **Implement** your changes and add tests.
+4.  **Submit** a Pull Request for review.
 
-We are working on a more detailed contribution guide. In the meantime, don't hesitate to get involved!
+Check out our [Issues](https://github.com/AmericoGarciaG/FinBase/issues) tab for tasks labeled `good first issue`!
 
-## 📜 License
+## 📄 License
 
-This project is distributed under the **MIT License**. See the [LICENSE](./LICENSE) file for more details.
+This project is licensed under the **MIT License**. See the [LICENSE](LICENSE) file for details.
+
+---
+
+### 🎉 Join Us in Building the Future of Open Financial Data!
+
+**FinBase** is more than a database; it's a movement to create a level playing field for financial innovation.
+
+**Explore the code and become a contributor today!** 🚀
 ```
+---

@@ -15,6 +15,26 @@ services:
       start_period: 5s
     restart: unless-stopped
 
+  finbase-db:
+    image: timescale/timescaledb:latest-pg16
+    container_name: finbase-db
+    environment:
+      - POSTGRES_DB=${DB_NAME:-finbase}
+      - POSTGRES_USER=${DB_USER:-finbase}
+      - POSTGRES_PASSWORD=${DB_PASSWORD:-supersecretpassword}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $POSTGRES_USER -d $POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      - ../storage-service/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+
   collector:
     build: .
     container_name: finbase-collector-yfinance
@@ -39,3 +59,30 @@ services:
         condition: service_healthy
     restart: unless-stopped
     stop_grace_period: 30s
+
+  storage_service:
+    build: ../storage-service
+    container_name: finbase-storage-service
+    environment:
+      # RabbitMQ
+      - RABBITMQ_HOST=rabbitmq
+      - INPUT_QUEUE=clean_data_queue
+      # DB
+      - DB_HOST=finbase-db
+      - DB_PORT=5432
+      - DB_NAME=${DB_NAME:-finbase}
+      - DB_USER=${DB_USER:-finbase}
+      - DB_PASSWORD=${DB_PASSWORD:-supersecretpassword}
+      # Batching
+      - BATCH_SIZE=${BATCH_SIZE:-1000}
+      - BATCH_TIMEOUT_SECONDS=${BATCH_TIMEOUT_SECONDS:-1}
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      finbase-db:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+volumes:
+  db_data:
