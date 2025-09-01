@@ -25,3 +25,17 @@ services:
         condition: service_healthy
     restart: unless-stopped
     stop_grace_period: 30s
+
+  quality_service:
+    build: ../quality-service
+    container_name: finbase-quality-service
+    environment:
+      - RABBITMQ_HOST=rabbitmq
+      - INPUT_QUEUE=raw_data_queue
+      - VALID_QUEUE=clean_data_queue
+      - INVALID_QUEUE=invalid_data_queue
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 30s
