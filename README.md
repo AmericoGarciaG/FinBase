@@ -1,8 +1,6 @@
 
 ---
 
-### 1. FinBase - The Open Ledger
-
 # FinBase - The Open Ledger
 ## The Open-Source Financial Database for Everyone
 

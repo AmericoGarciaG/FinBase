@@ -1,0 +1,149 @@
+version: "3.9"
+
+services:
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  finbase-db:
+    image: timescale/timescaledb:2.14.2-pg15
+    container_name: finbase-db
+    environment:
+      POSTGRES_PASSWORD: supersecretpassword
+      POSTGRES_USER: finbase
+      POSTGRES_DB: finbase
+    ports:
+      - "5432:5432"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+      - ./services/storage-service/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U finbase -d finbase"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  collector_service:
+    build:
+      context: ./services/collector-yfinance
+      dockerfile: Dockerfile
+    container_name: collector-service
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: guest
+      RABBITMQ_PASSWORD: guest
+      RAW_QUEUE_NAME: raw_data_queue
+      FETCH_INTERVAL_SECONDS: 60
+      TICKERS: "AAPL,MSFT"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  quality_service:
+    build:
+      context: ./services/quality-service
+      dockerfile: Dockerfile
+    container_name: quality-service
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: guest
+      RABBITMQ_PASSWORD: guest
+      INPUT_QUEUE: raw_data_queue
+      VALID_QUEUE: clean_data_queue
+      INVALID_QUEUE: invalid_data_queue
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  storage_service:
+    build:
+      context: ./services/storage-service
+      dockerfile: Dockerfile
+    container_name: storage-service
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: guest
+      RABBITMQ_PASSWORD: guest
+      INPUT_QUEUE: clean_data_queue
+      DB_HOST: finbase-db
+      DB_PORT: 5432
+      DB_NAME: finbase
+      DB_USER: finbase
+      DB_PASSWORD: supersecretpassword
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      finbase-db:
+        condition: service_healthy
+
+  api-service:
+    build:
+      context: ./services/api-service
+      dockerfile: Dockerfile
+    container_name: api-service
+    environment:
+      DB_HOST: finbase-db
+      DB_PORT: 5432
+      DB_NAME: finbase
+      DB_USER: finbase
+      DB_PASSWORD: supersecretpassword
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: guest
+      RABBITMQ_PASSWORD: guest
+      RABBITMQ_DATA_EVENTS_EXCHANGE: data_events
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      finbase-db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+
+  frontend_service:
+    build:
+      context: ./services/frontend-service
+      dockerfile: Dockerfile
+    container_name: frontend-service
+    ports:
+      - "8080:80"
+    # No depends_on to keep it decoupled; UI will show once Nginx is ready
+
+  backfill_worker:
+    build:
+      context: ./services/backfill-worker-service
+      dockerfile: Dockerfile
+    container_name: backfill-worker-service
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: guest
+      RABBITMQ_PASSWORD: guest
+      BACKFILL_JOBS_QUEUE: backfill_jobs_queue
+      RAW_QUEUE_NAME: raw_data_queue
+      BACKFILL_INTERVAL: 1d
+      CHUNK_MONTHS: 1
+      PREFETCH_COUNT: 1
+      SLEEP_BETWEEN_CHUNKS_SECONDS: 0.2
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  db-data:
+

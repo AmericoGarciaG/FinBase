@@ -288,6 +288,12 @@ def run():
                     continue
 
                 method, properties, body = item
+                
+                # Validate that method is not None (can happen with corrupted messages)
+                if method is None or not hasattr(method, 'delivery_tag'):
+                    logger.warning("Received invalid message with None method, skipping...")
+                    continue
+                    
                 deliveries.append((method.delivery_tag, body))
 
                 # Size-based flush
