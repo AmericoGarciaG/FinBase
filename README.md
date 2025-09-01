@@ -1,9 +1,8 @@
 
 ---
 
-### 1. Global `README.md` (For the project root)
+### 1. FinBase - The Open Ledger
 
-```markdown
 # FinBase - The Open Ledger
 ## The Open-Source Financial Database for Everyone
 
@@ -108,5 +107,4 @@ This project is licensed under the **MIT License**. See the [LICENSE](LICENSE) f
 **FinBase** is more than a database; it's a movement to create a level playing field for financial innovation.
 
 **Explore the code and become a contributor today!** 🚀
-```
 ---

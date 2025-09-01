@@ -84,5 +84,24 @@ services:
     restart: unless-stopped
     stop_grace_period: 30s
 
+  api_service:
+    build: ../api-service
+    container_name: finbase-api-service
+    environment:
+      - DB_HOST=finbase-db
+      - DB_PORT=5432
+      - DB_NAME=${DB_NAME:-finbase}
+      - DB_USER=${DB_USER:-finbase}
+      - DB_PASSWORD=${DB_PASSWORD:-supersecretpassword}
+      - API_HOST=0.0.0.0
+      - API_PORT=8000
+    depends_on:
+      finbase-db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    stop_grace_period: 30s
+
 volumes:
   db_data:
