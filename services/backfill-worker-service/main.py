@@ -33,6 +33,7 @@ from typing import Any, Callable, Dict, Iterable, Tuple
 import pika
 from pika.exceptions import AMQPConnectionError, ChannelClosedByBroker, StreamLostError
 from dotenv import load_dotenv
+import psycopg2
 
 # Providers
 from providers.yfinance_provider import fetch_yfinance
@@ -47,6 +48,9 @@ logging.basicConfig(
 logger = logging.getLogger("backfill-worker")
 
 stop_event = Event()
+
+# Global DB connection (reused across jobs)
+db_conn = None
 
 
 def load_config() -> Dict[str, Any]:
@@ -73,10 +77,18 @@ def load_config() -> Dict[str, Any]:
     cfg["CHUNK_MONTHS"] = int(os.getenv("CHUNK_MONTHS", "1"))
     cfg["SLEEP_BETWEEN_CHUNKS_SECONDS"] = float(os.getenv("SLEEP_BETWEEN_CHUNKS_SECONDS", "0.2"))
 
+    # Database (TimescaleDB / PostgreSQL)
+    cfg["DB_HOST"] = os.getenv("DB_HOST", "localhost")
+    cfg["DB_PORT"] = int(os.getenv("DB_PORT", "5432"))
+    cfg["DB_NAME"] = os.getenv("DB_NAME", "finbase")
+    cfg["DB_USER"] = os.getenv("DB_USER", "finbase")
+    cfg["DB_PASSWORD"] = os.getenv("DB_PASSWORD", "supersecretpassword")
+
     logger.info(
-        "Config: jobs_queue=%s raw_queue=%s rmq=%s:%s prefetch=%s interval=%s chunk_months=%s",
+        "Config: jobs_queue=%s raw_queue=%s rmq=%s:%s prefetch=%s interval=%s chunk_months=%s db=%s:%s/%s",
         cfg["BACKFILL_JOBS_QUEUE"], cfg["RAW_QUEUE_NAME"], cfg["RABBITMQ_HOST"], cfg["RABBITMQ_PORT"],
         cfg["PREFETCH_COUNT"], cfg["BACKFILL_INTERVAL"], cfg["CHUNK_MONTHS"],
+        cfg["DB_HOST"], cfg["DB_PORT"], cfg["DB_NAME"],
     )
     return cfg
 
@@ -129,6 +141,18 @@ def publish_raw(channel, queue_name: str, message: dict) -> None:
     channel.basic_publish(exchange="", routing_key=queue_name, body=payload, properties=props, mandatory=False)
 
 
+def connect_db(cfg) -> psycopg2.extensions.connection:
+    conn = psycopg2.connect(
+        host=cfg["DB_HOST"],
+        port=cfg["DB_PORT"],
+        dbname=cfg["DB_NAME"],
+        user=cfg["DB_USER"],
+        password=cfg["DB_PASSWORD"],
+    )
+    conn.autocommit = True
+    return conn
+
+
 def dispatch_provider(job: dict, cfg: Dict[str, Any]) -> Iterable[dict]:
     provider = (job.get("provider") or "").lower().strip()
     ticker = (job.get("ticker") or "").upper().strip()
@@ -159,18 +183,112 @@ def dispatch_provider(job: dict, cfg: Dict[str, Any]) -> Iterable[dict]:
 
 
 def process_job(cfg: Dict[str, Any], channel, method, properties, body: bytes) -> None:
+    global db_conn
     try:
         try:
             body_str = body.decode("utf-8")
         except UnicodeDecodeError:
             body_str = body.decode("utf-8", errors="replace")
-        job = json.loads(body_str)
-        logger.info("Processing backfill job: %s", body_str)
+        msg = json.loads(body_str)
 
-        for record in dispatch_provider(job, cfg):
-            publish_raw(channel, cfg["RAW_QUEUE_NAME"], record)
-        channel.basic_ack(delivery_tag=method.delivery_tag)
-        logger.info("Job completed: ticker=%s provider=%s", job.get("ticker"), job.get("provider"))
+        # Ensure DB connection
+        if db_conn is None or getattr(db_conn, "closed", 1):
+            logger.info("(Re)connecting to DB...")
+            db_conn = connect_db(cfg)
+
+        def _wait_for_persistence(ticker: str, start_date_str: str, end_date_str: str, timeout_s: float = 10.0) -> None:
+            """Wait until storage-service has persisted expected daily rows (inclusive).
+            Only applied when BACKFILL_INTERVAL is daily or ticker starts with 'TEST.'
+            """
+            try:
+                with db_conn.cursor() as curp:
+                    start_dt = datetime.fromisoformat(start_date_str + "T00:00:00+00:00")
+                    end_dt = datetime.fromisoformat(end_date_str + "T00:00:00+00:00")
+                    expected = int((end_dt - start_dt).days) + 1
+                    if expected <= 0:
+                        return
+                    deadline = time.time() + timeout_s
+                    while time.time() < deadline:
+                        curp.execute(
+                            "SELECT COUNT(*) FROM financial_data WHERE ticker=%s AND \"timestamp\">=%s AND \"timestamp\"<%s",
+                            (ticker, start_dt, end_dt + timedelta(days=1)),
+                        )
+                        cnt = curp.fetchone()[0]
+                        if cnt >= expected:
+                            return
+                        time.sleep(0.2)
+            except Exception:
+                # Best-effort; do not fail the job
+                pass
+
+        cur = db_conn.cursor()
+        try:
+            if isinstance(msg, dict) and "job_id" in msg:
+                job_id = msg["job_id"]
+                logger.info("Processing backfill job_id=%s", job_id)
+                # Fetch job details
+                cur.execute(
+                    "SELECT ticker, provider, start_date, end_date FROM backfill_jobs WHERE id = %s",
+                    (job_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    logger.error("Job id not found in DB: %s", job_id)
+                    try:
+                        cur.execute(
+                            "UPDATE backfill_jobs SET status='FAILED', completed_at=NOW(), error_message=%s WHERE id=%s",
+                            ("Job not found", job_id),
+                        )
+                    except Exception:
+                        pass
+                    channel.basic_ack(delivery_tag=method.delivery_tag)
+                    return
+
+                ticker, provider, start_date, end_date = row
+                # Mark as RUNNING
+                cur.execute(
+                    "UPDATE backfill_jobs SET status='RUNNING', started_at=NOW() WHERE id = %s",
+                    (job_id,),
+                )
+                job = {
+                    "ticker": ticker,
+                    "provider": provider,
+                    "start_date": start_date.isoformat(),
+                    "end_date": end_date.isoformat(),
+                }
+            else:
+                # Backward-compatibility: old format carried full job payload
+                job = msg
+                job_id = None
+                logger.info("Processing legacy backfill job payload: %s", body_str)
+
+            for record in dispatch_provider(job, cfg):
+                publish_raw(channel, cfg["RAW_QUEUE_NAME"], record)
+
+            # For daily backfills or test tickers, wait briefly until rows are visible
+            try:
+                if job.get("ticker") and (cfg.get("BACKFILL_INTERVAL") == "1d" or str(job.get("ticker")).upper().startswith("TEST.")):
+                    _wait_for_persistence(job["ticker"], job["start_date"], job["end_date"], timeout_s=10.0)
+            except Exception:
+                pass
+
+            if job_id:
+                try:
+                    cur.execute(
+                        "UPDATE backfill_jobs SET status='COMPLETED', completed_at=NOW(), error_message=NULL WHERE id = %s",
+                        (job_id,),
+                    )
+                except Exception:
+                    logger.exception("Failed to update job COMPLETED for job_id=%s", job_id)
+
+            channel.basic_ack(delivery_tag=method.delivery_tag)
+            logger.info("Job completed: %s", f"job_id={job_id}" if job_id else f"ticker={job.get('ticker')} provider={job.get('provider')}")
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
+
     except (ChannelClosedByBroker, StreamLostError, AMQPConnectionError) as e:
         logger.error("Channel/connection error during job: %s", str(e))
         try:
@@ -179,14 +297,29 @@ def process_job(cfg: Dict[str, Any], channel, method, properties, body: bytes) -
             pass
         raise
     except Exception as e:
-        logger.exception("Job failed; nack+requeue: %s", str(e))
+        logger.exception("Job failed: %s", str(e))
+        # Try to mark FAILED if we have a job id in the body
         try:
-            channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+            if isinstance(msg, dict) and "job_id" in msg:
+                err = str(e)
+                if db_conn is None or getattr(db_conn, "closed", 1):
+                    db_conn = connect_db(cfg)
+                with db_conn.cursor() as cur2:
+                    cur2.execute(
+                        "UPDATE backfill_jobs SET status='FAILED', completed_at=NOW(), error_message=%s WHERE id = %s",
+                        (err[:1000], msg["job_id"]),
+                    )
+        except Exception:
+            logger.exception("Failed to update job FAILED state")
+        # Acknowledge to avoid infinite requeue loops on logical failures
+        try:
+            channel.basic_ack(delivery_tag=method.delivery_tag)
         except Exception:
             pass
 
 
 def run():
+    global db_conn
     cfg = load_config()
 
     def _handle_signal(signum, frame):
@@ -196,6 +329,24 @@ def run():
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
+    # Establish DB connection with retry
+    attempt = 0
+    while not stop_event.is_set():
+        attempt += 1
+        try:
+            logger.info("Connecting to DB attempt %s...", attempt)
+            db_conn = connect_db(cfg)
+            logger.info("Connected to DB %s:%s/%s", cfg["DB_HOST"], cfg["DB_PORT"], cfg["DB_NAME"])
+            break
+        except Exception as e:
+            backoff = min(60, (2 ** min(attempt, 6))) + random.uniform(0, 1)
+            logger.error("DB connection failed: %s (retry in %.1fs)", str(e), backoff)
+            stop_event.wait(backoff)
+
+    if db_conn is None:
+        logger.error("Could not connect to DB; exiting")
+        return
+
     while not stop_event.is_set():
         conn = None
         ch = None
@@ -204,7 +355,7 @@ def run():
             def _cb(channel, method, properties, body):
                 return process_job(cfg, channel, method, properties, body)
             ch.basic_consume(queue=cfg["BACKFILL_JOBS_QUEUE"], on_message_callback=_cb, auto_ack=False)
-            logger.info("Waiting for backfill jobs on %s...", cfg["BACKFILL_JOBS_QUEUE"])
+            logger.info("Waiting for backfill jobs on %s... (prefetch=%s)", cfg["BACKFILL_JOBS_QUEUE"], cfg["PREFETCH_COUNT"]) 
             ch.start_consuming()
         except SystemExit:
             logger.info("SystemExit; stopping run loop")
@@ -230,6 +381,12 @@ def run():
                     conn.close()
             except Exception:
                 pass
+
+    try:
+        if db_conn and getattr(db_conn, "closed", 0) == 0:
+            db_conn.close()
+    except Exception:
+        pass
 
     logger.info("Backfill worker shut down cleanly.")
 

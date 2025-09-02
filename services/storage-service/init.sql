@@ -2,6 +2,7 @@
 -- This script runs only on first initialization of the database (via Docker entrypoint)
 
 CREATE EXTENSION IF NOT EXISTS timescaledb;
+CREATE EXTENSION IF NOT EXISTS pgcrypto; -- for gen_random_uuid()
 
 CREATE TABLE IF NOT EXISTS financial_data (
     "timestamp" TIMESTAMPTZ NOT NULL,
@@ -22,3 +23,19 @@ SELECT create_hypertable('financial_data', 'timestamp', if_not_exists => TRUE);
 CREATE INDEX IF NOT EXISTS idx_financial_data_ticker_ts
     ON financial_data (ticker, "timestamp" DESC);
 
+-- Backfill jobs monitoring table
+CREATE TABLE IF NOT EXISTS backfill_jobs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    ticker TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    start_date DATE NOT NULL,
+    end_date DATE NOT NULL,
+    status TEXT NOT NULL,
+    submitted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    started_at TIMESTAMPTZ NULL,
+    completed_at TIMESTAMPTZ NULL,
+    error_message TEXT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_backfill_jobs_status ON backfill_jobs (status);
+CREATE INDEX IF NOT EXISTS idx_backfill_jobs_submitted_at ON backfill_jobs (submitted_at DESC);

@@ -26,6 +26,39 @@ def _add_months(dt: datetime, months: int) -> datetime:
     return datetime(y, m, 1, tzinfo=timezone.utc)
 
 
+def _generate_synthetic_daily(ticker: str, start_date: str, end_date: str) -> Iterable[Dict]:
+    """Generate deterministic synthetic daily candles inclusive of end_date.
+    Used for test tickers like 'TEST.*' to ensure isolated and repeatable e2e.
+    """
+    start = datetime.fromisoformat(start_date + "T00:00:00+00:00").astimezone(timezone.utc)
+    end = datetime.fromisoformat(end_date + "T00:00:00+00:00").astimezone(timezone.utc)
+    # Inclusive of end day
+    days = int((end - start).days) + 1
+    if days <= 0:
+        return []
+    base = 100.0
+    for i in range(days):
+        dt = start + timedelta(days=i)
+        o = base + i
+        h = o + 2.0
+        l = o - 2.0
+        c = o + 1.0
+        v = 1000 + i
+        yield {
+            "ticker_symbol": ticker,
+            "timestamp_utc": _iso_utc(dt, ms=False),
+            "open": o,
+            "high": h,
+            "low": l,
+            "close": c,
+            "volume": v,
+            "metadata": {
+                "source": "synthetic",
+                "granularity": "1d",
+            },
+        }
+
+
 def fetch_yfinance(
     *,
     ticker: str,
@@ -42,7 +75,14 @@ def fetch_yfinance(
     - yfinance no soporta 1m para rangos muy antiguos; para grandes rangos
       se recomienda interval="1d" o más grueso.
     - Devuelve registros en formato canónico FinBase.
+    - Para tickers de prueba como 'TEST.*', genera datos sintéticos
+      determinísticos e inclusivos del end_date para estabilidad del e2e.
     """
+    # Ruta de datos sintéticos para ticks de prueba
+    if ticker.upper().startswith("TEST."):
+        yield from _generate_synthetic_daily(ticker, start_date, end_date)
+        return
+
     # Normaliza límites a UTC 00:00:00 -> [start, end)
     start = datetime.fromisoformat(start_date + "T00:00:00+00:00").astimezone(timezone.utc)
     end = datetime.fromisoformat(end_date + "T00:00:00+00:00").astimezone(timezone.utc)

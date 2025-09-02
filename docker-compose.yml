@@ -10,11 +10,16 @@ services:
     environment:
       RABBITMQ_DEFAULT_USER: guest
       RABBITMQ_DEFAULT_PASS: guest
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+      - rabbitmq_log:/var/log/rabbitmq  
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
-      interval: 10s
-      timeout: 5s
+      interval: 30s
+      timeout: 10s
       retries: 5
+      start_period: 60s
+    restart: unless-stopped
 
   finbase-db:
     image: timescale/timescaledb:2.14.2-pg15
@@ -84,6 +89,8 @@ services:
       DB_NAME: finbase
       DB_USER: finbase
       DB_PASSWORD: supersecretpassword
+      BATCH_SIZE: 1
+      BATCH_TIMEOUT_SECONDS: 0.1
     depends_on:
       rabbitmq:
         condition: service_healthy
@@ -106,6 +113,7 @@ services:
       RABBITMQ_USER: guest
       RABBITMQ_PASSWORD: guest
       RABBITMQ_DATA_EVENTS_EXCHANGE: data_events
+      BACKFILL_API_KEY: "FINBASE_ADMIN_KEY_abc123xyz"
     depends_on:
       rabbitmq:
         condition: service_healthy
@@ -139,11 +147,20 @@ services:
       CHUNK_MONTHS: 1
       PREFETCH_COUNT: 1
       SLEEP_BETWEEN_CHUNKS_SECONDS: 0.2
+      DB_HOST: finbase-db
+      DB_PORT: 5432
+      DB_NAME: finbase
+      DB_USER: finbase
+      DB_PASSWORD: supersecretpassword
     depends_on:
       rabbitmq:
+        condition: service_healthy
+      finbase-db:
         condition: service_healthy
     restart: unless-stopped
 
 volumes:
   db-data:
+  rabbitmq_data:
+  rabbitmq_log:
 

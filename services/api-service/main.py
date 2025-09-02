@@ -19,15 +19,18 @@ import json
 import logging
 import os
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from typing import Annotated, Dict, Iterable, List, Literal, Optional, Set, Tuple
 
 import asyncpg
 import pika
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, status
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, status, Depends, Security
 from fastapi import Body
+from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel, field_validator
+import psycopg2
+import uuid
 
 # Load environment from .env if present
 load_dotenv()
@@ -36,6 +39,18 @@ logger = logging.getLogger("api-service")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
 
 app = FastAPI(title="FinBase API", version="0.2.0")
+
+# Security: API Key required for backfill job creation
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+def require_api_key(api_key: Optional[str] = Security(api_key_header)) -> bool:
+    expected = os.getenv("BACKFILL_API_KEY")
+    if not expected:
+        # If no key configured, deny by default
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+    if not api_key or api_key != expected:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+    return True
 
 
 class Interval(BaseModel):
@@ -385,13 +400,49 @@ async def on_shutdown():
 # REST Endpoints
 # ----------------------
 @app.post("/v1/backfill/jobs", status_code=status.HTTP_202_ACCEPTED)
-async def create_backfill_job(job: BackfillJobRequest = Body(...)):
+async def create_backfill_job(job: BackfillJobRequest = Body(...), _: bool = Depends(require_api_key)):
     try:
         job.validate_range()
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
 
-    # Publish to RabbitMQ jobs queue
+    # Create backfill job in DB with status PENDING (sync psycopg2)
+    db_host = os.getenv("DB_HOST", "localhost")
+    db_port = int(os.getenv("DB_PORT", "5432"))
+    db_name = os.getenv("DB_NAME", "finbase")
+    db_user = os.getenv("DB_USER", "finbase")
+    db_password = os.getenv("DB_PASSWORD", "supersecretpassword")
+
+    job_id: Optional[uuid.UUID] = None
+    conn_db = None
+    try:
+        conn_db = psycopg2.connect(host=db_host, port=db_port, dbname=db_name, user=db_user, password=db_password)
+        conn_db.autocommit = True
+        with conn_db.cursor() as cur:
+            cur.execute(
+                "INSERT INTO backfill_jobs (ticker, provider, start_date, end_date, status) VALUES (%s, %s, %s, %s, %s) RETURNING id",
+                (
+                    job.ticker,
+                    job.provider,
+                    date.fromisoformat(job.start_date),
+                    date.fromisoformat(job.end_date),
+                    "PENDING",
+                ),
+            )
+            row = cur.fetchone()
+            if not row or not row[0]:
+                raise RuntimeError("Failed to obtain job id")
+            job_id = row[0]
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Failed to create job: {str(e)}")
+    finally:
+        try:
+            if conn_db:
+                conn_db.close()
+        except Exception:
+            pass
+
+    # Publish job id to RabbitMQ jobs queue
     queue_name = os.getenv("BACKFILL_JOBS_QUEUE", "backfill_jobs_queue")
     host = os.getenv("RABBITMQ_HOST", "localhost")
     port = int(os.getenv("RABBITMQ_PORT", "5672"))
@@ -413,7 +464,7 @@ async def create_backfill_job(job: BackfillJobRequest = Body(...)):
         conn = pika.BlockingConnection(params)
         ch = conn.channel()
         ch.queue_declare(queue=queue_name, durable=True)
-        payload = job.model_dump()
+        payload = {"job_id": str(job_id)}
         body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         props = pika.BasicProperties(content_type="application/json", delivery_mode=2)
         ch.basic_publish(exchange="", routing_key=queue_name, body=body, properties=props, mandatory=False)
@@ -425,24 +476,95 @@ async def create_backfill_job(job: BackfillJobRequest = Body(...)):
             conn.close()
         except Exception:
             pass
-        return {"status": "Backfill job accepted"}
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Failed to enqueue backfill job: {str(e)}")
 
+    return {"job_id": str(job_id)}
+
+
+class BackfillJobStatusResponse(BaseModel):
+    id: str
+    ticker: str
+    provider: str
+    start_date: str
+    end_date: str
+    status: str
+    submitted_at: Optional[str] = None
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    error_message: Optional[str] = None
+
+
+@app.get("/v1/backfill/jobs/{job_id}", response_model=BackfillJobStatusResponse)
+async def get_backfill_job_status(job_id: str):
+    # Sync query via psycopg2 for simplicity
+    db_host = os.getenv("DB_HOST", "localhost")
+    db_port = int(os.getenv("DB_PORT", "5432"))
+    db_name = os.getenv("DB_NAME", "finbase")
+    db_user = os.getenv("DB_USER", "finbase")
+    db_password = os.getenv("DB_PASSWORD", "supersecretpassword")
+
+    try:
+        # Validate UUID format
+        _ = uuid.UUID(job_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid job_id format")
+
+    conn_db = None
+    try:
+        conn_db = psycopg2.connect(host=db_host, port=db_port, dbname=db_name, user=db_user, password=db_password)
+        with conn_db.cursor() as cur:
+            cur.execute(
+                "SELECT id, ticker, provider, start_date, end_date, status, submitted_at, started_at, completed_at, error_message FROM backfill_jobs WHERE id = %s",
+                (job_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Job not found")
+            id_v, ticker, provider, sd, ed, status_v, sub_at, st_at, comp_at, err = row
+            resp = BackfillJobStatusResponse(
+                id=str(id_v),
+                ticker=ticker,
+                provider=provider,
+                start_date=sd.isoformat(),
+                end_date=ed.isoformat(),
+                status=status_v,
+                submitted_at=sub_at.isoformat() if sub_at else None,
+                started_at=st_at.isoformat() if st_at else None,
+                completed_at=comp_at.isoformat() if comp_at else None,
+                error_message=err,
+            )
+            return resp
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Failed to query job: {str(e)}")
+    finally:
+        try:
+            if conn_db:
+                conn_db.close()
+        except Exception:
+            pass
 
 @app.get("/v1/data/history/{ticker}", response_model=HistoryResponse)
 async def get_history(
     ticker: str,
     start_date: Optional[datetime] = Query(default=None, description="ISO date/time (UTC) inclusive lower bound"),
     end_date: Optional[datetime] = Query(default=None, description="ISO date/time (UTC) inclusive upper bound"),
-    interval: Literal["1min", "1hour", "1day"] = Query(default="1min", description="Aggregation interval"),
+    interval: str = Query(default="1min", description="Aggregation interval ('1min'|'1hour'|'1day' with aliases '1m'|'1h'|'1d')"),
     limit: int = Query(default=1000, ge=1, le=10000, description="Max rows to return"),
 ):
     """
     Time-based pagination: 'limit' means the most recent N candles within the given range.
     To page older data, set end_date to the earliest candle's timestamp minus a small delta and request again.
     """
-    q = HistoryQuery(start_date=start_date, end_date=end_date, interval=Interval(value=interval), limit=limit)
+    # Normalize interval aliases
+    aliases = {"1m": "1min", "1min": "1min", "1h": "1hour", "1hour": "1hour", "1d": "1day", "1day": "1day"}
+    norm_interval = aliases.get(interval)
+    if not norm_interval:
+        raise HTTPException(status_code=422, detail="Invalid interval; use one of 1min,1hour,1day (aliases: 1m,1h,1d)")
+
+    q = HistoryQuery(start_date=start_date, end_date=end_date, interval=Interval(value=norm_interval), limit=limit)
     try:
         q.validate_range()
     except ValueError as ve:
