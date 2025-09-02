@@ -8,7 +8,7 @@ load_dotenv()
 
 @pytest.fixture(scope="module")
 def db_connection():
-    """Crea una conexión a la BD para la limpieza."""
+    """Create a database connection to be used for test setup/teardown."""
     conn = psycopg2.connect(
         host=os.getenv("DB_HOST"),
         port=os.getenv("DB_PORT"),
@@ -18,20 +18,20 @@ def db_connection():
     )
     yield conn
     conn.close()
-
 @pytest.fixture
+
 def clean_test_ticker_data(db_connection):
-    """Fixture para asegurar que no hay datos del ticker de prueba."""
+    """Fixture to ensure the test ticker has no pre-existing data."""
     TEST_TICKER = "TEST.E2E"
     
-    # --- Setup (Organizar) ---
+    # --- Setup ---
     with db_connection.cursor() as cur:
         cur.execute("DELETE FROM financial_data WHERE ticker = %s", (TEST_TICKER,))
         db_connection.commit()
     
     yield TEST_TICKER  # El test se ejecuta aquí
     
-    # --- Teardown (Limpiar) ---
+    # --- Teardown ---
     with db_connection.cursor() as cur:
         cur.execute("DELETE FROM financial_data WHERE ticker = %s", (TEST_TICKER,))
         db_connection.commit()

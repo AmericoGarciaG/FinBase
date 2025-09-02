@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Backfill Worker Service
+Backfill Worker Service.
 
 - Consumes backfill jobs from BACKFILL_JOBS_QUEUE (RabbitMQ)
 - Dispatches to provider implementation (providers/*)
@@ -54,6 +54,11 @@ db_conn = None
 
 
 def load_config() -> Dict[str, Any]:
+    """Load environment-based configuration for the backfill worker.
+
+    Returns:
+        Dict[str, Any]: Configuration including RabbitMQ, DB, and worker tuning.
+    """
     load_dotenv()
     cfg: Dict[str, Any] = {}
     # RabbitMQ
@@ -94,6 +99,10 @@ def load_config() -> Dict[str, Any]:
 
 
 def connect_rabbit(cfg) -> Tuple[pika.BlockingConnection, pika.adapters.blocking_connection.BlockingChannel]:
+    """Connect to RabbitMQ with retry/backoff and ensure queues exist.
+
+    Returns a tuple (connection, channel) with QoS configured.
+    """
     credentials = pika.PlainCredentials(cfg["RABBITMQ_USER"], cfg["RABBITMQ_PASSWORD"])
     parameters = pika.ConnectionParameters(
         host=cfg["RABBITMQ_HOST"],
@@ -135,6 +144,7 @@ def connect_rabbit(cfg) -> Tuple[pika.BlockingConnection, pika.adapters.blocking
 
 
 def publish_raw(channel, queue_name: str, message: dict) -> None:
+    """Publish a JSON-serializable message as persistent to the given queue."""
     # Relax publisher confirms in local/dev to avoid spurious failures
     payload = json.dumps(message, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     props = pika.BasicProperties(content_type="application/json", delivery_mode=2)
@@ -142,6 +152,7 @@ def publish_raw(channel, queue_name: str, message: dict) -> None:
 
 
 def connect_db(cfg) -> psycopg2.extensions.connection:
+    """Open a PostgreSQL connection for job metadata operations (autocommit)."""
     conn = psycopg2.connect(
         host=cfg["DB_HOST"],
         port=cfg["DB_PORT"],
@@ -154,6 +165,11 @@ def connect_db(cfg) -> psycopg2.extensions.connection:
 
 
 def dispatch_provider(job: dict, cfg: Dict[str, Any]) -> Iterable[dict]:
+    """Dispatch a backfill job to the provider implementation and return its iterator.
+
+    Raises:
+        ValueError: If the job is missing required fields or provider unknown.
+    """
     provider = (job.get("provider") or "").lower().strip()
     ticker = (job.get("ticker") or "").upper().strip()
     start_date = job.get("start_date")
@@ -183,6 +199,7 @@ def dispatch_provider(job: dict, cfg: Dict[str, Any]) -> Iterable[dict]:
 
 
 def process_job(cfg: Dict[str, Any], channel, method, properties, body: bytes) -> None:
+    """Process a single job message: resolve job, stream records, and update status."""
     global db_conn
     try:
         try:
@@ -198,6 +215,7 @@ def process_job(cfg: Dict[str, Any], channel, method, properties, body: bytes) -
 
         def _wait_for_persistence(ticker: str, start_date_str: str, end_date_str: str, timeout_s: float = 10.0) -> None:
             """Wait until storage-service has persisted expected daily rows (inclusive).
+
             Only applied when BACKFILL_INTERVAL is daily or ticker starts with 'TEST.'
             """
             try:
@@ -319,6 +337,7 @@ def process_job(cfg: Dict[str, Any], channel, method, properties, body: bytes) -
 
 
 def run():
+    """Worker entrypoint: maintain RMQ consumption and DB connection lifecycle."""
     global db_conn
     cfg = load_config()
 

@@ -2,12 +2,17 @@ import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { ChartComponent } from './components/ChartComponent'
 import { getSymbols } from './api'
 
+// Available chart intervals (UI labels used for buttons)
 const intervals = [
   { key: '1min', label: '1m' },
   { key: '1hour', label: '1H' },
   { key: '1day', label: '1D' },
 ] as const
 
+/**
+ * Minimal FinBase demo UI: search/select a symbol and view its price chart.
+ * Uses REST endpoints for history and a WebSocket for live updates.
+ */
 export default function App() {
   const [symbols, setSymbols] = useState<string[]>([])
   const [query, setQuery] = useState('')

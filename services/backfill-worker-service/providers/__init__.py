@@ -1,2 +1,1 @@
-# Intentional empty package to group provider implementations
-
+"""Providers package for backfill implementations (e.g., yfinance)."""

@@ -1,3 +1,7 @@
+"""Provider utilities for fetching historical data via yfinance.
+
+Exports fetch_yfinance for backfill-worker-service.
+"""
 from __future__ import annotations
 
 import time
@@ -8,6 +12,15 @@ import yfinance as yf
 
 
 def _iso_utc(dt: datetime, ms: bool = False) -> str:
+    """Return an ISO 8601 UTC timestamp string with a trailing 'Z'.
+
+    Args:
+        dt: A naive or timezone-aware datetime instance.
+        ms: When True, include millisecond precision; otherwise, seconds.
+
+    Returns:
+        The UTC timestamp in ISO-8601 format, using 'Z' instead of '+00:00'.
+    """
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     else:
@@ -16,10 +29,18 @@ def _iso_utc(dt: datetime, ms: bool = False) -> str:
 
 
 def _month_start(dt: datetime) -> datetime:
+    """Return the first instant (00:00Z) of the month for the given datetime.
+
+    The result is always timezone-aware in UTC.
+    """
     return datetime(dt.year, dt.month, 1, tzinfo=timezone.utc)
 
 
 def _add_months(dt: datetime, months: int) -> datetime:
+    """Return the first day of the month that is 'months' after the given datetime.
+
+    Keeps the day anchored to the 1st and sets timezone to UTC.
+    """
     m = dt.month - 1 + months
     y = dt.year + m // 12
     m = m % 12 + 1
@@ -28,6 +49,7 @@ def _add_months(dt: datetime, months: int) -> datetime:
 
 def _generate_synthetic_daily(ticker: str, start_date: str, end_date: str) -> Iterable[Dict]:
     """Generate deterministic synthetic daily candles inclusive of end_date.
+
     Used for test tickers like 'TEST.*' to ensure isolated and repeatable e2e.
     """
     start = datetime.fromisoformat(start_date + "T00:00:00+00:00").astimezone(timezone.utc)
@@ -69,28 +91,38 @@ def fetch_yfinance(
     sleep_between_chunks_s: float = 0.2,
 ) -> Iterable[Dict]:
     """
-    Fetch historical candles from yfinance in monthly chunks (configurable).
+    Fetch historical candles from yfinance in month-sized chunks.
 
-    Notes:
-    - yfinance no soporta 1m para rangos muy antiguos; para grandes rangos
-      se recomienda interval="1d" o más grueso.
-    - Devuelve registros en formato canónico FinBase.
-    - Para tickers de prueba como 'TEST.*', genera datos sintéticos
-      determinísticos e inclusivos del end_date para estabilidad del e2e.
+    Behavior:
+    - Uses inclusive [start_date, end_date] at 00:00Z boundaries.
+    - Emits canonical FinBase records for each bar.
+    - For synthetic test tickers with prefix 'TEST.', generates deterministic daily data
+      inclusive of end_date for stable end-to-end tests (no external calls).
+
+    Args:
+        ticker: Ticker symbol, e.g. 'AAPL'.
+        start_date: Inclusive start date in YYYY-MM-DD (UTC).
+        end_date: Inclusive end date in YYYY-MM-DD (UTC).
+        interval: Requested granularity (e.g., '1d', '1h', '1m').
+        chunk_months: Number of months per request chunk to yfinance.
+        sleep_between_chunks_s: Sleep between chunks to be polite with remote API.
+
+    Yields:
+        dict: Canonical FinBase record per candle/bar.
     """
-    # Ruta de datos sintéticos para ticks de prueba
+    # Synthetic data path for test tickers
     if ticker.upper().startswith("TEST."):
         yield from _generate_synthetic_daily(ticker, start_date, end_date)
         return
 
-    # Normaliza límites a UTC 00:00:00 -> [start, end)
+    # Normalize bounds to UTC 00:00:00 -> [start, end)
     start = datetime.fromisoformat(start_date + "T00:00:00+00:00").astimezone(timezone.utc)
     end = datetime.fromisoformat(end_date + "T00:00:00+00:00").astimezone(timezone.utc)
 
     if start >= end:
         return []
 
-    # Alinea a inicios de mes para chunking
+    # Align to month starts for chunking
     cur = _month_start(start)
     last = _month_start(end)
 
@@ -98,7 +130,7 @@ def fetch_yfinance(
 
     while cur <= last:
         nxt = _add_months(cur, chunk_months)
-        # yfinance: end es exclusivo
+        # yfinance: 'end' is exclusive
         chunk_start = max(cur, start)
         chunk_end = min(nxt, end)
         if chunk_start >= chunk_end:

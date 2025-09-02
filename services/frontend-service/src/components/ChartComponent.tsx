@@ -1,13 +1,23 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { createChart, ColorType, IChartApi, ISeriesApi } from 'lightweight-charts'
+import type { UTCTimestamp } from 'lightweight-charts'
 import type { Candle, Interval } from '../api'
 import { getHistory } from '../api'
 
+/**
+ * Props for ChartComponent.
+ * - ticker: Symbol to chart.
+ * - interval: Aggregation interval.
+ */
 interface Props {
   ticker: string
   interval: Interval
 }
 
+/**
+ * Candlestick chart with infinite scroll backfill and live WebSocket updates.
+ * It loads initial history via REST then listens for real-time candles.
+ */
 export const ChartComponent: React.FC<Props> = ({ ticker, interval }) => {
   const containerRef = useRef<HTMLDivElement | null>(null)
   const chartRef = useRef<IChartApi | null>(null)
@@ -122,7 +132,7 @@ export const ChartComponent: React.FC<Props> = ({ ticker, interval }) => {
           const d = msg.data
           if (!seriesRef.current) return
           const update = {
-            time: Math.floor(new Date(d.timestamp).getTime() / 1000),
+            time: Math.floor(new Date(d.timestamp).getTime() / 1000) as UTCTimestamp,
             open: d.open, high: d.high, low: d.low, close: d.close,
           }
           seriesRef.current.update(update)

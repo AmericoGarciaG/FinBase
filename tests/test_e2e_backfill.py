@@ -13,14 +13,14 @@ JOB_TIMEOUT_SECONDS = 180
 
 def test_full_backfill_flow(clean_test_ticker_data):
     """
-    Prueba el flujo completo:
-    1. Solicita un backfill para un ticker de prueba.
-    2. Monitorea el estado del trabajo hasta que se complete.
-    3. Verifica que los datos se hayan insertado correctamente.
+    End-to-end backfill flow:
+    1. Submit a backfill for a test ticker.
+    2. Poll the job status until completion.
+    3. Verify data was inserted correctly via the history API.
     """
     TEST_TICKER = clean_test_ticker_data
     
-    # --- 1. Actuar: Solicitar el Backfill ---
+    # --- 1. Act: Submit the backfill ---
     job_payload = {
         "ticker": TEST_TICKER,
         "provider": "yfinance",
@@ -44,7 +44,7 @@ def test_full_backfill_flow(clean_test_ticker_data):
     assert job_id is not None
     print(f"Job submitted successfully. Job ID: {job_id}")
 
-    # --- 2. Actuar: Monitorear el Trabajo ---
+    # --- 2. Act: Monitor the job ---
     start_time = time.time()
     while time.time() - start_time < JOB_TIMEOUT_SECONDS:
         print(f"Polling job status for {job_id}...")
@@ -64,12 +64,12 @@ def test_full_backfill_flow(clean_test_ticker_data):
             assert False, f"Backfill job failed with error: {error_msg}"
             
         time.sleep(JOB_POLL_INTERVAL_SECONDS)
-    else: # Se ejecuta si el bucle while termina por timeout
+    else:  # Executes if the while loop times out
         assert False, f"Job {job_id} did not complete within {JOB_TIMEOUT_SECONDS} seconds."
 
     print("Job completed successfully.")
 
-    # --- 3. Verificar: Consultar los Datos ---
+    # --- 3. Verify: Query data ---
     print(f"Verifying data for {TEST_TICKER} via history API...")
     try:
         history_response = requests.get(
@@ -82,7 +82,7 @@ def test_full_backfill_flow(clean_test_ticker_data):
         
     data = history_response.json()
     
-    # Para el rango 2023-01-03 a 2023-01-05, esperamos 3 velas diarias.
+    # For the range 2023-01-03 to 2023-01-05, we expect 3 daily candles.
     assert data.get("count") == 3
     assert len(data.get("data", [])) == 3
     print(f"Verification successful: Found {data.get('count')} candles as expected.")

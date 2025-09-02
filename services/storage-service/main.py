@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FinBase Storage Service
+FinBase Storage Service.
 
 Consumes validated messages from clean_data_queue and persists them into
 TimescaleDB (PostgreSQL) using efficient batch inserts with idempotency.
@@ -47,6 +47,11 @@ stop_event = Event()
 # ----------------------
 
 def load_config() -> Dict[str, Any]:
+    """Load configuration from environment variables with sane defaults.
+
+    Returns:
+        Dict[str, Any]: Configuration dictionary used by the service.
+    """
     load_dotenv()
     cfg: Dict[str, Any] = {}
 
@@ -87,6 +92,10 @@ def load_config() -> Dict[str, Any]:
 # ----------------------
 
 def connect_rabbitmq(cfg) -> Tuple[pika.BlockingConnection, pika.adapters.blocking_connection.BlockingChannel]:
+    """Connect to RabbitMQ with backoff and ensure input queue/QoS.
+
+    Returns a tuple of (connection, channel).
+    """
     credentials = pika.PlainCredentials(cfg["RABBITMQ_USER"], cfg["RABBITMQ_PASSWORD"])
     parameters = pika.ConnectionParameters(
         host=cfg["RABBITMQ_HOST"],
@@ -125,6 +134,10 @@ def connect_rabbitmq(cfg) -> Tuple[pika.BlockingConnection, pika.adapters.blocki
 
 
 def connect_db(cfg) -> psycopg2.extensions.connection:
+    """Connect to PostgreSQL with backoff and a health probe (SELECT 1).
+
+    Returns a connection with autocommit disabled for transactional batches.
+    """
     attempt = 0
     max_attempts = cfg["MAX_CONNECTION_ATTEMPTS"]
     while not stop_event.is_set():
@@ -159,7 +172,8 @@ def connect_db(cfg) -> psycopg2.extensions.connection:
 
 def build_row(record: Dict[str, Any]) -> Tuple[Any, ...]:
     """Map canonical JSON record to DB row tuple.
-    Returns a tuple: (timestamp, ticker, open, high, low, close, volume, source)
+
+    Returns a tuple: (timestamp, ticker, open, high, low, close, volume, source).
     """
     ts = record.get("timestamp_utc")
     ticker = record.get("ticker_symbol")
@@ -253,6 +267,10 @@ def flush_batch(cfg, db_conn, channel, deliveries: List[Tuple[int, bytes]]) -> N
 # ----------------------
 
 def run():
+    """Service entrypoint: consume from RabbitMQ and batch-insert into TimescaleDB.
+
+    The loop flushes by size or time and is resilient to RMQ/DB interruptions.
+    """
     cfg = load_config()
 
     def _handle_signal(signum, frame):

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FinBase Collector - Yahoo Finance Data Source
+FinBase Collector - Yahoo Finance Data Source.
 
 This microservice fetches financial data from Yahoo Finance using the yfinance library
 and publishes it to RabbitMQ in the FinBase canonical format.
@@ -58,10 +58,10 @@ def isoformat_utc(dt: datetime, milliseconds: bool = True) -> str:
 
 
 def load_config():
-    """
-    Load configuration from environment with defaults. Only the required variables
-    need to be present in .env; others are optional with defaults.
-    
+    """Load configuration from environment with defaults.
+
+    Only the required variables need to be present in .env; others are optional with defaults.
+
     Returns:
         dict: Configuration dictionary
     """
@@ -98,8 +98,8 @@ def load_config():
 
 
 def connect_rabbitmq(cfg) -> Tuple[pika.BlockingConnection, pika.adapters.blocking_connection.BlockingChannel]:
-    """
-    Establish a RabbitMQ connection and channel with retry/backoff.
+    """Establish a RabbitMQ connection and channel with retry/backoff.
+
     Ensures the target queue exists and enables publisher confirms.
     
     Args:
@@ -164,10 +164,8 @@ def connect_rabbitmq(cfg) -> Tuple[pika.BlockingConnection, pika.adapters.blocki
 
 
 def fetch_latest_candle(ticker: str) -> Optional[dict]:
-    """
-    Fetch the latest 1-minute candle for the given ticker from yfinance,
-    and transform it into the canonical JSON format.
-    
+    """Fetch the latest 1-minute candle and return canonical JSON.
+
     Args:
         ticker: Stock ticker symbol
         
@@ -278,8 +276,9 @@ def publish_json(channel, queue_name: str, message: dict) -> None:
 
 
 def run():
-    """
-    Main application loop. Loads configuration, connects to RabbitMQ,
+    """Run main application loop.
+
+    Loads configuration, connects to RabbitMQ,
     and continuously fetches and publishes financial data.
     """
     cfg = load_config()

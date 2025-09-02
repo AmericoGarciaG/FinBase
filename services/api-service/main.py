@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FinBase API Service (read-only)
+FinBase API Service (read-only).
 
 FastAPI + asyncpg service providing historical data from TimescaleDB.
 Exposes: GET /v1/data/history/{ticker}
@@ -44,6 +44,7 @@ app = FastAPI(title="FinBase API", version="0.2.0")
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 def require_api_key(api_key: Optional[str] = Security(api_key_header)) -> bool:
+    """Validate the X-API-Key header against BACKFILL_API_KEY env var."""
     expected = os.getenv("BACKFILL_API_KEY")
     if not expected:
         # If no key configured, deny by default
@@ -54,16 +55,21 @@ def require_api_key(api_key: Optional[str] = Security(api_key_header)) -> bool:
 
 
 class Interval(BaseModel):
+    """Represent a requested aggregation interval."""
+
     value: Literal["1min", "1hour", "1day"]
 
     @property
     def bucket(self) -> Optional[timedelta]:
+        """Return the time bucket for aggregated intervals; None for '1min'."""
         if self.value == "1min":
             return None  # no aggregation
         return {"1hour": timedelta(hours=1), "1day": timedelta(days=1)}[self.value]
 
 
 class HistoryQuery(BaseModel):
+    """Parameters for history queries, including range, interval, and limit."""
+
     start_date: Optional[datetime] = None
     end_date: Optional[datetime] = None
     interval: Interval
@@ -88,11 +94,14 @@ class HistoryQuery(BaseModel):
         return v
 
     def validate_range(self) -> None:
+        """Raise ValueError if start_date is after end_date."""
         if self.start_date and self.end_date and self.start_date > self.end_date:
             raise ValueError("start_date must be <= end_date")
 
 
 class Candle(BaseModel):
+    """OHLCV candle returned by the API."""
+
     timestamp: datetime
     open: Optional[float] = None
     high: Optional[float] = None
@@ -102,6 +111,8 @@ class Candle(BaseModel):
 
 
 class HistoryResponse(BaseModel):
+    """Envelope for history response payloads."""
+
     ticker: str
     interval: str
     count: int
@@ -109,10 +120,14 @@ class HistoryResponse(BaseModel):
 
 
 class SymbolsResponse(BaseModel):
+    """List of distinct available symbols."""
+
     symbols: List[str]
 
 
 class BackfillJobRequest(BaseModel):
+    """Request body for creating a backfill job."""
+
     ticker: str
     provider: Literal["yfinance"]
     start_date: str  # YYYY-MM-DD
@@ -128,6 +143,7 @@ class BackfillJobRequest(BaseModel):
         return v
 
     def validate_range(self) -> None:
+        """Raise ValueError for invalid YYYY-MM-DD or if start_date > end_date."""
         try:
             sd = datetime.fromisoformat(self.start_date + "T00:00:00")
             ed = datetime.fromisoformat(self.end_date + "T00:00:00")
@@ -138,6 +154,7 @@ class BackfillJobRequest(BaseModel):
 
 
 async def _make_pool() -> asyncpg.Pool:
+    """Create an asyncpg connection pool using env configuration."""
     host = os.getenv("DB_HOST", "localhost")
     port = int(os.getenv("DB_PORT", "5432"))
     db = os.getenv("DB_NAME", "finbase")
@@ -155,13 +172,17 @@ async def _make_pool() -> asyncpg.Pool:
 # WebSocket connection manager
 # ----------------------
 class ConnectionManager:
+    """Tracks WebSocket clients and their per-ticker interval subscriptions."""
+
     def __init__(self) -> None:
+        """Initialize the connection manager state."""
         self._active: Set[WebSocket] = set()
         # Per-connection subscriptions: websocket -> {ticker: interval}
         self._subs: Dict[WebSocket, Dict[str, str]] = {}
         self._lock = asyncio.Lock()
 
     async def connect(self, websocket: WebSocket) -> None:
+        """Accept and register a new WebSocket connection."""
         await websocket.accept()
         async with self._lock:
             self._active.add(websocket)
@@ -169,12 +190,14 @@ class ConnectionManager:
         logger.info("WebSocket connected. Active=%d", len(self._active))
 
     async def disconnect(self, websocket: WebSocket) -> None:
+        """Unregister and forget a WebSocket connection."""
         async with self._lock:
             self._active.discard(websocket)
             self._subs.pop(websocket, None)
         logger.info("WebSocket disconnected. Active=%d", len(self._active))
 
     async def subscribe(self, websocket: WebSocket, tickers: Iterable[str], interval: str = "1min") -> None:
+        """Subscribe a WebSocket to one or more tickers at the given interval."""
         tickers = [t.upper() for t in tickers]
         async with self._lock:
             wsmap = self._subs.setdefault(websocket, {})
@@ -183,6 +206,7 @@ class ConnectionManager:
         logger.info("WS %s subscribed: %s @ %s", id(websocket), ",".join(tickers), interval)
 
     async def unsubscribe(self, websocket: WebSocket, tickers: Iterable[str]) -> None:
+        """Unsubscribe a WebSocket from one or more tickers."""
         tickers = [t.upper() for t in tickers]
         async with self._lock:
             wsmap = self._subs.get(websocket, {})
@@ -190,6 +214,7 @@ class ConnectionManager:
                 wsmap.pop(t, None)
 
     async def get_unique_subscriptions(self) -> Set[Tuple[str, str]]:
+        """Return a set of (ticker, interval) pairs currently subscribed by any client."""
         async with self._lock:
             pairs: Set[Tuple[str, str]] = set()
             for wsmap in self._subs.values():
@@ -198,6 +223,7 @@ class ConnectionManager:
             return pairs
 
     async def get_clients_for(self, ticker: str, interval: str) -> List[WebSocket]:
+        """Return clients subscribed to the given (ticker, interval)."""
         async with self._lock:
             out: List[WebSocket] = []
             for ws, wsmap in self._subs.items():
@@ -214,6 +240,7 @@ manager = ConnectionManager()
 # ----------------------
 async def _start_rabbitmq_listener(app_ref: FastAPI) -> None:
     """Start a blocking pika consumer in a background thread.
+
     It posts event tokens into an asyncio.Queue consumed by an async dispatcher.
     """
     loop = asyncio.get_running_loop()
@@ -335,6 +362,7 @@ async def _start_rabbitmq_listener(app_ref: FastAPI) -> None:
 
 
 async def _fetch_latest_candle(conn: asyncpg.Connection, ticker: str, interval: str) -> Optional[Candle]:
+    """Return the most recent candle for the (ticker, interval), or None if missing."""
     ticker = ticker.upper()
     if interval == "1min":
         row = await conn.fetchrow(
@@ -373,12 +401,14 @@ async def _fetch_latest_candle(conn: asyncpg.Connection, ticker: str, interval: 
 
 @app.on_event("startup")
 async def on_startup():
+    """Initialize the DB pool and start the RabbitMQ listener."""
     app.state.pool = await _make_pool()
     await _start_rabbitmq_listener(app)
 
 
 @app.on_event("shutdown")
 async def on_shutdown():
+    """Stop background tasks and close the DB pool."""
     # Stop RMQ
     try:
         if getattr(app.state, "rmq_dispatcher_task", None):
@@ -401,6 +431,7 @@ async def on_shutdown():
 # ----------------------
 @app.post("/v1/backfill/jobs", status_code=status.HTTP_202_ACCEPTED)
 async def create_backfill_job(job: BackfillJobRequest = Body(...), _: bool = Depends(require_api_key)):
+    """Create a backfill job and enqueue its id to RabbitMQ."""
     try:
         job.validate_range()
     except ValueError as ve:
@@ -483,6 +514,8 @@ async def create_backfill_job(job: BackfillJobRequest = Body(...), _: bool = Dep
 
 
 class BackfillJobStatusResponse(BaseModel):
+    """Status representation for a submitted backfill job."""
+
     id: str
     ticker: str
     provider: str
@@ -497,6 +530,7 @@ class BackfillJobStatusResponse(BaseModel):
 
 @app.get("/v1/backfill/jobs/{job_id}", response_model=BackfillJobStatusResponse)
 async def get_backfill_job_status(job_id: str):
+    """Look up the current status of a backfill job by id."""
     # Sync query via psycopg2 for simplicity
     db_host = os.getenv("DB_HOST", "localhost")
     db_port = int(os.getenv("DB_PORT", "5432"))
@@ -554,7 +588,8 @@ async def get_history(
     interval: str = Query(default="1min", description="Aggregation interval ('1min'|'1hour'|'1day' with aliases '1m'|'1h'|'1d')"),
     limit: int = Query(default=1000, ge=1, le=10000, description="Max rows to return"),
 ):
-    """
+    """Return historical OHLCV candles for a ticker.
+
     Time-based pagination: 'limit' means the most recent N candles within the given range.
     To page older data, set end_date to the earliest candle's timestamp minus a small delta and request again.
     """
@@ -632,6 +667,7 @@ async def get_history(
 
 @app.get("/v1/symbols", response_model=SymbolsResponse)
 async def get_symbols():
+    """Return the distinct set of available symbols."""
     pool: asyncpg.Pool = app.state.pool
     async with pool.acquire() as conn:
         rows = await conn.fetch("SELECT DISTINCT ticker FROM financial_data ORDER BY ticker ASC")
@@ -644,6 +680,7 @@ async def get_symbols():
 # ----------------------
 @app.websocket("/v1/stream")
 async def websocket_stream(ws: WebSocket):
+    """Websocket endpoint for real-time candle updates and subscriptions."""
     await manager.connect(ws)
     try:
         # Expect initial subscription message

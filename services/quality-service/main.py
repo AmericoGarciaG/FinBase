@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FinBase Quality Service
+FinBase Quality Service.
 
 Consumes messages from raw_data_queue, validates payloads against business rules,
 and routes them to clean_data_queue (valid) or invalid_data_queue (invalid).
@@ -43,9 +43,7 @@ stop_event = Event()
 
 
 def load_config():
-    """
-    Load configuration from environment with sensible defaults.
-    """
+    """Load configuration from environment with sensible defaults."""
     load_dotenv()
     cfg = {}
 
@@ -81,8 +79,8 @@ def load_config():
 
 
 def connect_rabbitmq(cfg) -> Tuple[pika.BlockingConnection, pika.adapters.blocking_connection.BlockingChannel]:
-    """
-    Establish RabbitMQ connection and channel with retry/backoff.
+    """Establish RabbitMQ connection and channel with retry/backoff.
+
     Declares required queues (durable) and enables publisher confirms and QoS.
     """
     credentials = pika.PlainCredentials(cfg["RABBITMQ_USER"], cfg["RABBITMQ_PASSWORD"])
@@ -167,8 +165,8 @@ def publish_json(channel, queue_name: str, message: dict) -> None:
 
 
 def process_message(cfg, channel, method, properties, body: bytes):
-    """
-    Callback for each consumed message from INPUT_QUEUE.
+    """Process a consumed message.
+
     - Valid -> route original body to VALID_QUEUE, then ack
     - Invalid -> build envelope with original_message and validation_error, route to INVALID_QUEUE, then ack
     - On publish failure -> nack with requeue=True
@@ -227,6 +225,7 @@ def process_message(cfg, channel, method, properties, body: bytes):
 
 
 def run():
+    """Start consumption loop and handle reconnections."""
     cfg = load_config()
 
     def _handle_signal(signum, frame):
