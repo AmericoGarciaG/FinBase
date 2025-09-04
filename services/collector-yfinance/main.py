@@ -198,7 +198,7 @@ def fetch_latest_candle(ticker: str) -> Optional[dict]:
             logger.warning("yfinance returned empty DataFrame for ticker=%s", ticker)
             return None
 
-        last = df.tail(1)
+        last = df.tail(1) # TEMPORAL. Tiene que evolucionar para cuando haya escalamiento con cientos de microservicios. 
         index = last.index[0]
 
         # Convert index timestamp to UTC

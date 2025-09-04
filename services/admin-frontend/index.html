@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FinBase Admin Panel</title>
+    <link rel="stylesheet" href="style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="container">
+        <header class="header">
+            <h1>FinBase Admin Panel</h1>
+            <p class="subtitle">Manage backfill jobs and monitor system status</p>
+        </header>
+
+        <div class="main-content">
+            <!-- Job Creation Panel -->
+            <section class="panel">
+                <div class="panel-header">
+                    <h2>Create Backfill Job</h2>
+                    <p>Submit a new historical data backfill request</p>
+                </div>
+                
+                <form id="jobForm" class="job-form">
+                    <div class="form-group">
+                        <label for="apiKey">API Key</label>
+                        <input 
+                            type="password" 
+                            id="apiKey" 
+                            name="apiKey" 
+                            required 
+                            placeholder="Enter your API key"
+                            class="form-input"
+                        >
+                        <small class="form-hint">This key is used to authenticate backfill requests</small>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="ticker">Ticker Symbol</label>
+                            <input 
+                                type="text" 
+                                id="ticker" 
+                                name="ticker" 
+                                required 
+                                placeholder="e.g., AAPL, MSFT"
+                                class="form-input"
+                                pattern="[A-Za-z0-9.-]+"
+                                title="Only letters, numbers, dots and dashes allowed"
+                            >
+                        </div>
+
+                        <div class="form-group">
+                            <label for="provider">Data Provider</label>
+                            <select id="provider" name="provider" required class="form-input">
+                                <option value="">Select Provider</option>
+                                <option value="yfinance">Yahoo Finance</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="startDate">Start Date</label>
+                            <input 
+                                type="date" 
+                                id="startDate" 
+                                name="startDate" 
+                                required 
+                                class="form-input"
+                            >
+                        </div>
+
+                        <div class="form-group">
+                            <label for="endDate">End Date</label>
+                            <input 
+                                type="date" 
+                                id="endDate" 
+                                name="endDate" 
+                                required 
+                                class="form-input"
+                            >
+                        </div>
+                    </div>
+
+                    <div class="form-actions">
+                        <button type="submit" class="btn btn-primary" id="submitBtn">
+                            <span class="btn-text">Submit Job</span>
+                            <span class="btn-loading hidden">Submitting...</span>
+                        </button>
+                        <button type="reset" class="btn btn-secondary">Clear Form</button>
+                    </div>
+                </form>
+
+                <!-- Status Messages -->
+                <div id="statusMessages" class="status-messages"></div>
+            </section>
+
+            <!-- Job Monitoring Panel -->
+            <section class="panel">
+                <div class="panel-header">
+                    <h2>Job Monitoring</h2>
+                    <div class="panel-controls">
+                        <span class="status-indicator">
+                            <span class="indicator-dot" id="connectionStatus"></span>
+                            <span id="connectionText">Checking connection...</span>
+                        </span>
+                        <button id="refreshBtn" class="btn btn-sm btn-outline">Refresh</button>
+                        <button id="clearJobsBtn" class="btn btn-sm btn-outline">Clear Completed</button>
+                    </div>
+                </div>
+
+                <div class="table-container">
+                    <table class="jobs-table" id="jobsTable">
+                        <thead>
+                            <tr>
+                                <th>Job ID</th>
+                                <th>Ticker</th>
+                                <th>Provider</th>
+                                <th>Date Range</th>
+                                <th>Status</th>
+                                <th>Progress</th>
+                                <th>Created</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="jobsTableBody">
+                            <tr class="no-jobs">
+                                <td colspan="8">
+                                    <div class="empty-state">
+                                        <p>No jobs found. Create your first backfill job above.</p>
+                                    </div>
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <div class="table-footer">
+                    <div class="table-info">
+                        <span id="jobCount">0 jobs</span> • 
+                        <span id="lastRefresh">Never updated</span>
+                    </div>
+                    <div class="auto-refresh">
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="autoRefresh" checked>
+                            Auto-refresh every 10 seconds
+                        </label>
+                    </div>
+                </div>
+            </section>
+        </div>
+
+        <footer class="footer">
+            <p>&copy; 2025 FinBase - The Open Ledger. Admin Panel v1.0</p>
+        </footer>
+    </div>
+
+    <!-- Modal for job details -->
+    <div id="jobModal" class="modal hidden">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 id="modalTitle">Job Details</h3>
+                <button class="modal-close" id="modalClose">&times;</button>
+            </div>
+            <div class="modal-body" id="modalBody">
+                <!-- Job details will be populated here -->
+            </div>
+        </div>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>

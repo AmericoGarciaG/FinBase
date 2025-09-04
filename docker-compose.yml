@@ -29,7 +29,7 @@ services:
       POSTGRES_USER: finbase
       POSTGRES_DB: finbase
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - db-data:/var/lib/postgresql/data
       - ./services/storage-service/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
@@ -131,6 +131,27 @@ services:
       - "8080:80"
     # No depends_on to keep it decoupled; UI will show once Nginx is ready
 
+  admin_frontend:
+    build:
+      context: ./services/admin-frontend
+      dockerfile: Dockerfile
+    container_name: admin-frontend
+    ports:
+      - "8081:80"
+    depends_on:
+      api-service:
+        condition: service_started
+    environment:
+      - NGINX_HOST=localhost
+      - NGINX_PORT=80
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
   backfill_worker:
     build:
       context: ./services/backfill-worker-service
@@ -143,7 +164,7 @@ services:
       RABBITMQ_PASSWORD: guest
       BACKFILL_JOBS_QUEUE: backfill_jobs_queue
       RAW_QUEUE_NAME: raw_data_queue
-      BACKFILL_INTERVAL: 1d
+      BACKFILL_INTERVAL: 1m
       CHUNK_MONTHS: 1
       PREFETCH_COUNT: 1
       SLEEP_BETWEEN_CHUNKS_SECONDS: 0.2

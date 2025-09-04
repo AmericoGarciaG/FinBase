@@ -58,7 +58,7 @@ def load_config():
     # Queues
     cfg["INPUT_QUEUE"] = os.getenv("INPUT_QUEUE", "raw_data_queue")
     cfg["VALID_QUEUE"] = os.getenv("VALID_QUEUE", "clean_data_queue")
-    cfg["INVALID_QUEUE"] = os.getenv("INVALID_QUEUE", "invalid_data_queue")
+    cfg["INVALID_QUEUE"] = os.getenv("INVALID_QUEUE", "invalid_data_queue") # TEMPORAL. Hay que dar tratamiento a la cola de datos inválidos.
 
     # Consumer tuning
     cfg["PREFETCH_COUNT"] = int(os.getenv("PREFETCH_COUNT", "50"))
