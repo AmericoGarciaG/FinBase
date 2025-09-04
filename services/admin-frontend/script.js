@@ -96,7 +96,7 @@ class AdminPanel {
         try {
             this.updateConnectionStatus('checking', 'Checking API connection...');
             
-            const response = await fetch(`${this.apiBaseUrl}/symbols`, {
+            const response = await fetch(`${this.apiBaseUrl}/backfill/jobs`, {
                 method: 'GET',
                 headers: { 'Content-Type': 'application/json' }
             });
@@ -165,7 +165,11 @@ class AdminPanel {
             const responseData = await response.json();
 
             if (response.ok) {
-                this.showStatusMessage('success', `Job created successfully! Job ID: ${responseData.job_id}`);
+                // Handle both new architecture responses and legacy ones
+                const jobId = responseData.master_job_id || responseData.job_id;
+                const apiMessage = responseData.message || 'Job created successfully!';
+                const fullMessage = `${apiMessage} (Job ID: ${jobId})`;
+                this.showStatusMessage('success', fullMessage);
                 this.jobForm.reset();
                 this.initializeApp(); // Reset form to defaults
                 await this.refreshJobs(); // Refresh table immediately
@@ -235,23 +239,40 @@ class AdminPanel {
         this.isRefreshing = true;
         
         try {
-            // Temporary: Show message that job monitoring is coming soon
+            const response = await fetch(`${this.apiBaseUrl}/backfill/jobs`, {
+                method: 'GET',
+                headers: { 'Content-Type': 'application/json' }
+            });
+
+            if (response.ok) {
+                const data = await response.json();
+                this.updateJobsTable(data.jobs || []);
+                this.updateLastRefreshTime();
+            } else {
+                console.error('Failed to fetch jobs:', response.statusText);
+                this.showStatusMessage('error', 'Failed to load jobs');
+                this.jobsTableBody.innerHTML = `
+                    <tr class="no-jobs">
+                        <td colspan="8">
+                            <div class="empty-state">
+                                <p>❌ Failed to load jobs. Please try again later.</p>
+                            </div>
+                        </td>
+                    </tr>
+                `;
+            }
+        } catch (error) {
+            console.error('Error refreshing jobs:', error);
+            this.showStatusMessage('error', 'Network error: Unable to connect to API service');
             this.jobsTableBody.innerHTML = `
                 <tr class="no-jobs">
                     <td colspan="8">
                         <div class="empty-state">
-                            <h3>🚧 Job Monitoring Coming Soon!</h3>
-                            <p>The backfill job creation is working perfectly! 🎉</p>
-                            <p>Job monitoring and status tracking will be available in the next update.</p>
-                            <p>For now, you can check job progress in the database or through the backfill worker logs.</p>
+                            <p>🔌 Network error: Unable to connect to API service</p>
                         </div>
                     </td>
                 </tr>
             `;
-            this.updateJobCount(0);
-            this.updateLastRefreshTime();
-        } catch (error) {
-            console.error('Error refreshing jobs:', error);
         } finally {
             this.isRefreshing = false;
         }
@@ -262,12 +283,12 @@ class AdminPanel {
         const activeJobIds = new Set();
         
         jobs.forEach(job => {
-            const previousJob = this.jobs.get(job.job_id);
-            this.jobs.set(job.job_id, job);
+            const previousJob = this.jobs.get(job.id);
+            this.jobs.set(job.id, job);
             
             // Track active jobs for monitoring
             if (job.status === 'PENDING' || job.status === 'RUNNING') {
-                activeJobIds.add(job.job_id);
+                activeJobIds.add(job.id);
             }
             
             // Check if job status changed
@@ -319,22 +340,22 @@ class AdminPanel {
         }
 
         // Sort jobs by creation date (newest first)
-        const sortedJobs = jobs.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+        const sortedJobs = jobs.sort((a, b) => new Date(b.submitted_at) - new Date(a.submitted_at));
         
         this.jobsTableBody.innerHTML = sortedJobs.map(job => this.renderJobRow(job)).join('');
     }
 
     renderJobRow(job) {
         const dateRange = this.formatDateRange(job.start_date, job.end_date);
-        const createdAt = this.formatTimestamp(job.created_at);
+        const createdAt = this.formatTimestamp(job.submitted_at);
         const progress = this.calculateProgress(job);
         const statusBadge = this.renderStatusBadge(job.status);
         
         return `
-            <tr data-job-id="${job.job_id}" class="slide-in">
+            <tr data-job-id="${job.id}" class="slide-in">
                 <td>
-                    <span class="job-id" title="${job.job_id}">
-                        ${job.job_id.slice(0, 8)}...
+                    <span class="job-id" title="${job.id}">
+                        ${job.id.slice(0, 8)}...
                     </span>
                 </td>
                 <td><strong>${job.ticker}</strong></td>
@@ -355,16 +376,16 @@ class AdminPanel {
                     </div>
                 </td>
                 <td>
-                    <span class="timestamp" title="${job.created_at}">
+                    <span class="timestamp" title="${job.submitted_at}">
                         ${createdAt}
                     </span>
                 </td>
                 <td>
-                    <button class="action-btn view" onclick="adminPanel.showJobDetails('${job.job_id}')">
+                    <button class="action-btn view" onclick="adminPanel.showJobDetails('${job.id}')">
                         View
                     </button>
                     ${job.status === 'PENDING' || job.status === 'RUNNING' ? 
-                        `<button class="action-btn cancel" onclick="adminPanel.cancelJob('${job.job_id}')">
+                        `<button class="action-btn cancel" onclick="adminPanel.cancelJob('${job.id}')">
                             Cancel
                         </button>` : ''
                     }
@@ -411,6 +432,28 @@ class AdminPanel {
         if (diffMinutes < 1440) return `${Math.floor(diffMinutes / 60)}h ago`;
         
         return date.toLocaleDateString() + ' ' + date.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+    }
+
+    calculateDuration(startedAt, completedAt) {
+        if (!startedAt) return '-';
+        
+        const startTime = new Date(startedAt);
+        const endTime = completedAt ? new Date(completedAt) : new Date();
+        const durationMs = endTime - startTime;
+        
+        if (durationMs < 0) return '-';
+        
+        const seconds = Math.floor(durationMs / 1000);
+        const minutes = Math.floor(seconds / 60);
+        const hours = Math.floor(minutes / 60);
+        
+        if (hours > 0) {
+            return `${hours}h ${minutes % 60}m`;
+        } else if (minutes > 0) {
+            return `${minutes}m ${seconds % 60}s`;
+        } else {
+            return `${seconds}s`;
+        }
     }
 
     updateJobCount(count) {
@@ -474,61 +517,109 @@ class AdminPanel {
     renderJobDetailsContent(job) {
         const progress = this.calculateProgress(job);
         
+        // Check if this is a detailed job response with sub-jobs
+        const isDetailedJob = job.master_job && job.sub_jobs;
+        const masterJob = isDetailedJob ? job.master_job : job;
+        const subJobs = isDetailedJob ? job.sub_jobs : [];
+        const progressSummary = isDetailedJob ? job.progress_summary : {};
+        
         return `
             <div class="job-details">
                 <div class="detail-section">
                     <h4>Basic Information</h4>
                     <table class="detail-table">
-                        <tr><td><strong>Job ID:</strong></td><td><code>${job.job_id}</code></td></tr>
-                        <tr><td><strong>Ticker:</strong></td><td>${job.ticker}</td></tr>
-                        <tr><td><strong>Provider:</strong></td><td>${job.provider}</td></tr>
-                        <tr><td><strong>Status:</strong></td><td>${this.renderStatusBadge(job.status)}</td></tr>
-                        <tr><td><strong>Created:</strong></td><td>${new Date(job.created_at).toLocaleString()}</td></tr>
+                        <tr><td><strong>Job ID:</strong></td><td><code>${masterJob.id}</code></td></tr>
+                        <tr><td><strong>Ticker:</strong></td><td>${masterJob.ticker}</td></tr>
+                        <tr><td><strong>Provider:</strong></td><td>${masterJob.provider}</td></tr>
+                        <tr><td><strong>Status:</strong></td><td>${this.renderStatusBadge(masterJob.status)}</td></tr>
+                        <tr><td><strong>Created:</strong></td><td>${new Date(masterJob.submitted_at).toLocaleString()}</td></tr>
+                        ${masterJob.total_sub_jobs ? `<tr><td><strong>Total Sub-jobs:</strong></td><td>${masterJob.total_sub_jobs}</td></tr>` : ''}
                     </table>
                 </div>
 
                 <div class="detail-section">
                     <h4>Date Range</h4>
                     <table class="detail-table">
-                        <tr><td><strong>Start Date:</strong></td><td>${job.start_date}</td></tr>
-                        <tr><td><strong>End Date:</strong></td><td>${job.end_date}</td></tr>
+                        <tr><td><strong>Start Date:</strong></td><td>${masterJob.start_date}</td></tr>
+                        <tr><td><strong>End Date:</strong></td><td>${masterJob.end_date}</td></tr>
                     </table>
                 </div>
 
                 <div class="detail-section">
-                    <h4>Progress</h4>
+                    <h4>Progress Overview</h4>
                     <div class="progress-container" style="max-width: 100%;">
                         <div class="progress-bar">
                             <div class="progress-fill" style="width: ${progress.percentage}%"></div>
                         </div>
                         <p style="margin-top: 0.5rem;">${progress.text}</p>
                     </div>
-                    ${job.processed_records ? `
-                        <table class="detail-table" style="margin-top: 1rem;">
-                            <tr><td><strong>Processed Records:</strong></td><td>${job.processed_records.toLocaleString()}</td></tr>
-                            <tr><td><strong>Total Records:</strong></td><td>${job.total_records ? job.total_records.toLocaleString() : 'Unknown'}</td></tr>
-                        </table>
+                    
+                    ${Object.keys(progressSummary).length > 0 ? `
+                        <div class="progress-summary">
+                            <h5>Sub-jobs Status:</h5>
+                            <div class="status-chips">
+                                ${Object.entries(progressSummary).map(([status, count]) => 
+                                    `<span class="status-chip status-${status.toLowerCase()}">${status}: ${count}</span>`
+                                ).join('')}
+                            </div>
+                        </div>
+                    ` : ''}
+                    
+                    ${masterJob.message ? `
+                        <div class="job-message">
+                            <strong>Planning Details:</strong><br>
+                            <span>${masterJob.message}</span>
+                        </div>
                     ` : ''}
                 </div>
 
-                ${job.error_message ? `
+                ${subJobs.length > 0 ? `
                     <div class="detail-section">
-                        <h4>Error Details</h4>
-                        <div class="error-details">
-                            <code>${job.error_message}</code>
+                        <h4>Sub-jobs Details (${subJobs.length} total)</h4>
+                        <div class="sub-jobs-container">
+                            <table class="sub-jobs-table">
+                                <thead>
+                                    <tr>
+                                        <th>ID</th>
+                                        <th>Date Range</th>
+                                        <th>Status</th>
+                                        <th>Records</th>
+                                        <th>Duration</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    ${subJobs.map(subJob => `
+                                        <tr class="sub-job-row status-${subJob.status.toLowerCase()}">
+                                            <td><code>${subJob.id.slice(0, 8)}...</code></td>
+                                            <td>${subJob.start_date} to ${subJob.end_date}</td>
+                                            <td>${this.renderStatusBadge(subJob.status)}</td>
+                                            <td>${subJob.records_published ? subJob.records_published.toLocaleString() : '0'}</td>
+                                            <td>${this.calculateDuration(subJob.started_at, subJob.completed_at)}</td>
+                                        </tr>
+                                    `).join('')}
+                                </tbody>
+                            </table>
                         </div>
                     </div>
                 ` : ''}
 
-                ${job.updated_at ? `
+                ${masterJob.error_message ? `
                     <div class="detail-section">
-                        <h4>Timestamps</h4>
-                        <table class="detail-table">
-                            <tr><td><strong>Last Updated:</strong></td><td>${new Date(job.updated_at).toLocaleString()}</td></tr>
-                            ${job.completed_at ? `<tr><td><strong>Completed:</strong></td><td>${new Date(job.completed_at).toLocaleString()}</td></tr>` : ''}
-                        </table>
+                        <h4>Error Details</h4>
+                        <div class="error-details">
+                            <code>${masterJob.error_message}</code>
+                        </div>
                     </div>
                 ` : ''}
+
+                <div class="detail-section">
+                    <h4>Timestamps</h4>
+                    <table class="detail-table">
+                        <tr><td><strong>Submitted:</strong></td><td>${new Date(masterJob.submitted_at).toLocaleString()}</td></tr>
+                        ${masterJob.started_at ? `<tr><td><strong>Started:</strong></td><td>${new Date(masterJob.started_at).toLocaleString()}</td></tr>` : ''}
+                        ${masterJob.completed_at ? `<tr><td><strong>Completed:</strong></td><td>${new Date(masterJob.completed_at).toLocaleString()}</td></tr>` : ''}
+                    </table>
+                </div>
             </div>
 
             <style>
@@ -563,6 +654,81 @@ class AdminPanel {
                     color: #dc2626;
                     font-size: 0.9rem;
                     word-break: break-word;
+                }
+                .progress-summary {
+                    margin-top: 1rem;
+                }
+                .progress-summary h5 {
+                    margin-bottom: 0.5rem;
+                    color: #4b5563;
+                }
+                .status-chips {
+                    display: flex;
+                    flex-wrap: wrap;
+                    gap: 0.5rem;
+                }
+                .status-chip {
+                    padding: 0.25rem 0.5rem;
+                    border-radius: 0.25rem;
+                    font-size: 0.75rem;
+                    font-weight: 500;
+                }
+                .status-chip.status-pending {
+                    background: #fef3c7;
+                    color: #92400e;
+                }
+                .status-chip.status-running {
+                    background: #dbeafe;
+                    color: #1e40af;
+                }
+                .status-chip.status-completed {
+                    background: #d1fae5;
+                    color: #065f46;
+                }
+                .status-chip.status-failed {
+                    background: #fee2e2;
+                    color: #b91c1c;
+                }
+                .job-message {
+                    margin-top: 1rem;
+                    padding: 0.75rem;
+                    background: #f3f4f6;
+                    border-radius: 0.5rem;
+                    font-size: 0.9rem;
+                }
+                .sub-jobs-container {
+                    max-height: 300px;
+                    overflow-y: auto;
+                    border: 1px solid #e5e7eb;
+                    border-radius: 0.5rem;
+                }
+                .sub-jobs-table {
+                    width: 100%;
+                    border-collapse: collapse;
+                    font-size: 0.875rem;
+                }
+                .sub-jobs-table th {
+                    background: #f9fafb;
+                    padding: 0.75rem 0.5rem;
+                    text-align: left;
+                    font-weight: 600;
+                    color: #374151;
+                    border-bottom: 1px solid #e5e7eb;
+                    position: sticky;
+                    top: 0;
+                }
+                .sub-jobs-table td {
+                    padding: 0.5rem;
+                    border-bottom: 1px solid #f3f4f6;
+                }
+                .sub-job-row.status-completed {
+                    background: #f0fdf4;
+                }
+                .sub-job-row.status-failed {
+                    background: #fef2f2;
+                }
+                .sub-job-row.status-running {
+                    background: #eff6ff;
                 }
             </style>
         `;

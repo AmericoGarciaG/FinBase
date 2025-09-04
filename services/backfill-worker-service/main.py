@@ -199,7 +199,7 @@ def dispatch_provider(job: dict, cfg: Dict[str, Any]) -> Iterable[dict]:
 
 
 def process_job(cfg: Dict[str, Any], channel, method, properties, body: bytes) -> None:
-    """Process a single job message: resolve job, stream records, and update status."""
+    """Process a single job message: resolve sub-job or legacy job, stream records, and update status."""
     global db_conn
     try:
         try:
@@ -241,20 +241,142 @@ def process_job(cfg: Dict[str, Any], channel, method, properties, body: bytes) -
 
         cur = db_conn.cursor()
         try:
-            if isinstance(msg, dict) and "job_id" in msg:
-                job_id = msg["job_id"]
-                logger.info("Processing backfill job_id=%s", job_id)
-                # Fetch job details
+            records_published = 0
+            
+            # Check if this is a new-style sub-job or legacy job
+            if isinstance(msg, dict) and "sub_job_id" in msg:
+                # New architecture: sub-job processing
+                sub_job_id = msg["sub_job_id"]
+                logger.info("Processing sub-job sub_job_id=%s", sub_job_id)
+                
+                # Fetch sub-job details
                 cur.execute(
-                    "SELECT ticker, provider, start_date, end_date FROM backfill_jobs WHERE id = %s",
-                    (job_id,),
+                    "SELECT id, master_job_id, ticker, provider, start_date, end_date FROM sub_backfill_jobs WHERE id = %s",
+                    (sub_job_id,),
                 )
                 row = cur.fetchone()
                 if not row:
-                    logger.error("Job id not found in DB: %s", job_id)
+                    logger.error("Sub-job id not found in DB: %s", sub_job_id)
                     try:
                         cur.execute(
-                            "UPDATE backfill_jobs SET status='FAILED', completed_at=NOW(), error_message=%s WHERE id=%s",
+                            "UPDATE sub_backfill_jobs SET status='FAILED', completed_at=NOW(), error_message=%s WHERE id=%s",
+                            ("Sub-job not found", sub_job_id),
+                        )
+                    except Exception:
+                        pass
+                    channel.basic_ack(delivery_tag=method.delivery_tag)
+                    return
+
+                sub_id, master_job_id, ticker, provider, start_date, end_date = row
+                
+                # Mark sub-job as RUNNING
+                cur.execute(
+                    "UPDATE sub_backfill_jobs SET status='RUNNING', started_at=NOW() WHERE id = %s",
+                    (sub_job_id,),
+                )
+                
+                job = {
+                    "ticker": ticker,
+                    "provider": provider,
+                    "start_date": start_date.isoformat(),
+                    "end_date": end_date.isoformat(),
+                }
+                
+                # Process the sub-job
+                for record in dispatch_provider(job, cfg):
+                    publish_raw(channel, cfg["RAW_QUEUE_NAME"], record)
+                    records_published += 1
+
+                # Wait for persistence if applicable
+                try:
+                    if job.get("ticker") and (cfg.get("BACKFILL_INTERVAL") == "1d" or str(job.get("ticker")).upper().startswith("TEST.")):
+                        _wait_for_persistence(job["ticker"], job["start_date"], job["end_date"], timeout_s=10.0)
+                except Exception:
+                    pass
+
+                # Mark sub-job as COMPLETED with record count
+                try:
+                    cur.execute(
+                        "UPDATE sub_backfill_jobs SET status='COMPLETED', completed_at=NOW(), error_message=NULL, records_published=%s WHERE id = %s",
+                        (records_published, sub_job_id),
+                    )
+                    
+                    # Check if master job should be marked as completed
+                    # (when all sub-jobs are in COMPLETED or FAILED state)
+                    cur.execute(
+                        "SELECT COUNT(*) as total, " 
+                        "SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END) as completed, "
+                        "SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) as failed "
+                        "FROM sub_backfill_jobs WHERE master_job_id = %s",
+                        (master_job_id,)
+                    )
+                    summary = cur.fetchone()
+                    if summary:
+                        total, completed, failed = summary
+                        if (completed + failed) == total:
+                            # All sub-jobs are done
+                            if failed == 0:
+                                # All completed successfully
+                                cur.execute(
+                                    "UPDATE master_backfill_jobs SET status='COMPLETED', completed_at=NOW() WHERE id = %s",
+                                    (master_job_id,)
+                                )
+                            else:
+                                # Some failed
+                                cur.execute(
+                                    "UPDATE master_backfill_jobs SET status='PARTIALLY_COMPLETED', completed_at=NOW(), "
+                                    "error_message=%s WHERE id = %s",
+                                    (f"{failed} of {total} sub-jobs failed", master_job_id)
+                                )
+                        elif completed > 0 or failed > 0:
+                            # Some sub-jobs have started/finished, mark master as running
+                            cur.execute(
+                                "UPDATE master_backfill_jobs SET status='RUNNING', started_at=COALESCE(started_at, NOW()) WHERE id = %s",
+                                (master_job_id,)
+                            )
+                            
+                except Exception:
+                    logger.exception("Failed to update sub-job COMPLETED for sub_job_id=%s", sub_job_id)
+
+                channel.basic_ack(delivery_tag=method.delivery_tag)
+                logger.info("Sub-job completed: sub_job_id=%s, records_published=%d", sub_job_id, records_published)
+                
+            elif isinstance(msg, dict) and "job_id" in msg:
+                # Legacy architecture: master job processing (for backwards compatibility)
+                job_id = msg["job_id"]
+                logger.info("Processing legacy backfill job_id=%s", job_id)
+                
+                # Check first in master_backfill_jobs, then fall back to legacy tables if they exist
+                cur.execute(
+                    "SELECT ticker, provider, start_date, end_date FROM master_backfill_jobs WHERE id = %s",
+                    (job_id,),
+                )
+                row = cur.fetchone()
+                
+                if not row:
+                    # Try legacy backfill_jobs table if it still exists
+                    try:
+                        cur.execute(
+                            "SELECT ticker, provider, start_date, end_date FROM backfill_jobs WHERE id = %s",
+                            (job_id,),
+                        )
+                        row = cur.fetchone()
+                        if row:
+                            # Update legacy table
+                            ticker, provider, start_date, end_date = row
+                            cur.execute(
+                                "UPDATE backfill_jobs SET status='RUNNING', started_at=NOW() WHERE id = %s",
+                                (job_id,),
+                            )
+                    except Exception:
+                        # Legacy table doesn't exist, that's ok
+                        pass
+                
+                if not row:
+                    logger.error("Job id not found in any table: %s", job_id)
+                    try:
+                        cur.execute(
+                            "UPDATE master_backfill_jobs SET status='FAILED', completed_at=NOW(), error_message=%s WHERE id=%s",
                             ("Job not found", job_id),
                         )
                     except Exception:
@@ -263,44 +385,55 @@ def process_job(cfg: Dict[str, Any], channel, method, properties, body: bytes) -
                     return
 
                 ticker, provider, start_date, end_date = row
+                
                 # Mark as RUNNING
                 cur.execute(
-                    "UPDATE backfill_jobs SET status='RUNNING', started_at=NOW() WHERE id = %s",
+                    "UPDATE master_backfill_jobs SET status='RUNNING', started_at=NOW() WHERE id = %s",
                     (job_id,),
                 )
+                
                 job = {
                     "ticker": ticker,
                     "provider": provider,
                     "start_date": start_date.isoformat(),
                     "end_date": end_date.isoformat(),
                 }
-            else:
-                # Backward-compatibility: old format carried full job payload
-                job = msg
-                job_id = None
-                logger.info("Processing legacy backfill job payload: %s", body_str)
+                
+                for record in dispatch_provider(job, cfg):
+                    publish_raw(channel, cfg["RAW_QUEUE_NAME"], record)
+                    records_published += 1
 
-            for record in dispatch_provider(job, cfg):
-                publish_raw(channel, cfg["RAW_QUEUE_NAME"], record)
+                # For daily backfills or test tickers, wait briefly until rows are visible
+                try:
+                    if job.get("ticker") and (cfg.get("BACKFILL_INTERVAL") == "1d" or str(job.get("ticker")).upper().startswith("TEST.")):
+                        _wait_for_persistence(job["ticker"], job["start_date"], job["end_date"], timeout_s=10.0)
+                except Exception:
+                    pass
 
-            # For daily backfills or test tickers, wait briefly until rows are visible
-            try:
-                if job.get("ticker") and (cfg.get("BACKFILL_INTERVAL") == "1d" or str(job.get("ticker")).upper().startswith("TEST.")):
-                    _wait_for_persistence(job["ticker"], job["start_date"], job["end_date"], timeout_s=10.0)
-            except Exception:
-                pass
-
-            if job_id:
                 try:
                     cur.execute(
-                        "UPDATE backfill_jobs SET status='COMPLETED', completed_at=NOW(), error_message=NULL WHERE id = %s",
+                        "UPDATE master_backfill_jobs SET status='COMPLETED', completed_at=NOW(), error_message=NULL WHERE id = %s",
                         (job_id,),
                     )
                 except Exception:
                     logger.exception("Failed to update job COMPLETED for job_id=%s", job_id)
 
-            channel.basic_ack(delivery_tag=method.delivery_tag)
-            logger.info("Job completed: %s", f"job_id={job_id}" if job_id else f"ticker={job.get('ticker')} provider={job.get('provider')}")
+                channel.basic_ack(delivery_tag=method.delivery_tag)
+                logger.info("Legacy job completed: job_id=%s, records_published=%d", job_id, records_published)
+                
+            else:
+                # Very old format carried full job payload
+                job = msg
+                logger.info("Processing very legacy backfill job payload: %s", body_str)
+                
+                for record in dispatch_provider(job, cfg):
+                    publish_raw(channel, cfg["RAW_QUEUE_NAME"], record)
+                    records_published += 1
+
+                channel.basic_ack(delivery_tag=method.delivery_tag)
+                logger.info("Very legacy job completed: ticker=%s provider=%s, records_published=%d", 
+                          job.get('ticker'), job.get('provider'), records_published)
+                
         finally:
             try:
                 cur.close()
@@ -318,15 +451,24 @@ def process_job(cfg: Dict[str, Any], channel, method, properties, body: bytes) -
         logger.exception("Job failed: %s", str(e))
         # Try to mark FAILED if we have a job id in the body
         try:
-            if isinstance(msg, dict) and "job_id" in msg:
+            if isinstance(msg, dict):
                 err = str(e)
                 if db_conn is None or getattr(db_conn, "closed", 1):
                     db_conn = connect_db(cfg)
+                    
                 with db_conn.cursor() as cur2:
-                    cur2.execute(
-                        "UPDATE backfill_jobs SET status='FAILED', completed_at=NOW(), error_message=%s WHERE id = %s",
-                        (err[:1000], msg["job_id"]),
-                    )
+                    if "sub_job_id" in msg:
+                        # Failed sub-job
+                        cur2.execute(
+                            "UPDATE sub_backfill_jobs SET status='FAILED', completed_at=NOW(), error_message=%s WHERE id = %s",
+                            (err[:1000], msg["sub_job_id"]),
+                        )
+                    elif "job_id" in msg:
+                        # Failed master job or legacy job
+                        cur2.execute(
+                            "UPDATE master_backfill_jobs SET status='FAILED', completed_at=NOW(), error_message=%s WHERE id = %s",
+                            (err[:1000], msg["job_id"]),
+                        )
         except Exception:
             logger.exception("Failed to update job FAILED state")
         # Acknowledge to avoid infinite requeue loops on logical failures

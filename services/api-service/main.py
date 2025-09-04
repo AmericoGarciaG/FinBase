@@ -31,6 +31,7 @@ from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel, field_validator
 import psycopg2
 import uuid
+from dateutil.relativedelta import relativedelta
 
 # Load environment from .env if present
 load_dotenv()
@@ -427,94 +428,296 @@ async def on_shutdown():
 
 
 # ----------------------
+# Intelligent Coverage Planning Functions
+# ----------------------
+def calculate_coverage_gaps(requested_start: date, requested_end: date, existing_ranges: List[Tuple[date, date]]) -> List[Tuple[date, date]]:
+    """Calculate gaps in coverage for the requested date range.
+    
+    Args:
+        requested_start: Start date of the requested range
+        requested_end: End date of the requested range
+        existing_ranges: List of (start_date, end_date) tuples that already exist
+    
+    Returns:
+        List of (start_date, end_date) tuples representing gaps that need to be filled
+    """
+    if not existing_ranges:
+        return [(requested_start, requested_end)]
+    
+    # Sort existing ranges by start date
+    sorted_ranges = sorted(existing_ranges)
+    gaps = []
+    
+    current_start = requested_start
+    
+    for start, end in sorted_ranges:
+        # Skip ranges that are completely outside our requested range
+        if end < requested_start or start > requested_end:
+            continue
+            
+        # Adjust range to overlap with our requested range
+        range_start = max(start, requested_start)
+        range_end = min(end, requested_end)
+        
+        # If there's a gap before this range, add it
+        if current_start < range_start:
+            gaps.append((current_start, range_start - timedelta(days=1)))
+            
+        # Move our current start to after this range
+        current_start = max(current_start, range_end + timedelta(days=1))
+    
+    # If there's still uncovered area at the end, add it
+    if current_start <= requested_end:
+        gaps.append((current_start, requested_end))
+    
+    return gaps
+
+def fragment_date_range_by_months(start_date: date, end_date: date, months_per_fragment: int = 1) -> List[Tuple[date, date]]:
+    """Fragment a date range into chunks of N months each.
+    
+    Args:
+        start_date: Start date of the range
+        end_date: End date of the range 
+        months_per_fragment: Number of months per fragment
+        
+    Returns:
+        List of (start_date, end_date) tuples representing fragments
+    """
+    fragments = []
+    current_start = start_date
+    
+    while current_start <= end_date:
+        # Calculate end of this fragment
+        current_end = min(
+            current_start + relativedelta(months=months_per_fragment) - timedelta(days=1),
+            end_date
+        )
+        
+        fragments.append((current_start, current_end))
+        
+        # Move to next fragment
+        current_start = current_end + timedelta(days=1)
+    
+    return fragments
+
+# ----------------------
 # REST Endpoints
 # ----------------------
 @app.post("/v1/backfill/jobs", status_code=status.HTTP_202_ACCEPTED)
 async def create_backfill_job(job: BackfillJobRequest = Body(...), _: bool = Depends(require_api_key)):
-    """Create a backfill job and enqueue its id to RabbitMQ."""
+    """Create a backfill master job with intelligent coverage planning.
+    
+    This endpoint implements smart planning logic:
+    1. Analyzes existing coverage for the ticker/provider combination
+    2. Calculates gaps that need to be filled
+    3. Creates a master job and fragments gaps into sub-jobs
+    4. Publishes sub-job IDs to RabbitMQ queue
+    """
     try:
         job.validate_range()
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
 
-    # Create backfill job in DB with status PENDING (sync psycopg2)
+    # Parse requested date range
+    requested_start = date.fromisoformat(job.start_date)
+    requested_end = date.fromisoformat(job.end_date)
+    
+    # Database connection setup
     db_host = os.getenv("DB_HOST", "localhost")
     db_port = int(os.getenv("DB_PORT", "5432"))
     db_name = os.getenv("DB_NAME", "finbase")
     db_user = os.getenv("DB_USER", "finbase")
     db_password = os.getenv("DB_PASSWORD", "supersecretpassword")
 
-    job_id: Optional[uuid.UUID] = None
     conn_db = None
     try:
         conn_db = psycopg2.connect(host=db_host, port=db_port, dbname=db_name, user=db_user, password=db_password)
         conn_db.autocommit = True
+        
         with conn_db.cursor() as cur:
+            # Step 1: Query existing coverage for this ticker/provider
             cur.execute(
-                "INSERT INTO backfill_jobs (ticker, provider, start_date, end_date, status) VALUES (%s, %s, %s, %s, %s) RETURNING id",
+                "SELECT start_date, end_date FROM sub_backfill_jobs "
+                "WHERE ticker = %s AND provider = %s AND status IN ('PENDING', 'RUNNING', 'COMPLETED')",
+                (job.ticker, job.provider)
+            )
+            existing_ranges = cur.fetchall()
+            
+            # Step 2: Calculate coverage gaps
+            gaps = calculate_coverage_gaps(requested_start, requested_end, existing_ranges)
+            
+            if not gaps:
+                # No gaps found - all data already exists or is being processed
+                return {
+                    "message": "All data for the requested range already exists or is being processed.",
+                    "ticker": job.ticker,
+                    "provider": job.provider,
+                    "start_date": job.start_date,
+                    "end_date": job.end_date,
+                    "gaps_found": 0,
+                    "sub_jobs_created": 0
+                }
+            
+            # Step 3: Create master job
+            cur.execute(
+                "INSERT INTO master_backfill_jobs (ticker, provider, start_date, end_date, status, total_sub_jobs, message) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
                 (
                     job.ticker,
                     job.provider,
-                    date.fromisoformat(job.start_date),
-                    date.fromisoformat(job.end_date),
+                    requested_start,
+                    requested_end,
                     "PENDING",
-                ),
+                    0,  # Will be updated after creating sub-jobs
+                    f"Planning intelligent backfill with {len(gaps)} gaps to fill"
+                )
             )
-            row = cur.fetchone()
-            if not row or not row[0]:
-                raise RuntimeError("Failed to obtain job id")
-            job_id = row[0]
+            master_job_row = cur.fetchone()
+            if not master_job_row:
+                raise RuntimeError("Failed to create master job")
+            master_job_id = master_job_row[0]
+            
+            # Step 4: Fragment each gap and create sub-jobs
+            sub_job_ids = []
+            total_sub_jobs = 0
+            
+            for gap_start, gap_end in gaps:
+                # Fragment this gap into monthly chunks
+                fragments = fragment_date_range_by_months(gap_start, gap_end, months_per_fragment=1)
+                
+                for frag_start, frag_end in fragments:
+                    # Create sub-job for this fragment
+                    cur.execute(
+                        "INSERT INTO sub_backfill_jobs (master_job_id, ticker, provider, start_date, end_date, status) "
+                        "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
+                        (master_job_id, job.ticker, job.provider, frag_start, frag_end, "PENDING")
+                    )
+                    sub_job_row = cur.fetchone()
+                    if sub_job_row:
+                        sub_job_ids.append(str(sub_job_row[0]))
+                        total_sub_jobs += 1
+            
+            # Step 5: Update master job with total count and final message
+            gaps_summary = "; ".join([f"{start} to {end}" for start, end in gaps])
+            final_message = f"Created {total_sub_jobs} sub-jobs to fill {len(gaps)} coverage gaps: {gaps_summary}"
+            
+            cur.execute(
+                "UPDATE master_backfill_jobs SET total_sub_jobs = %s, message = %s WHERE id = %s",
+                (total_sub_jobs, final_message, master_job_id)
+            )
+            
     except Exception as e:
+        logger.exception("Failed to create intelligent backfill job")
         raise HTTPException(status_code=503, detail=f"Failed to create job: {str(e)}")
     finally:
-        try:
-            if conn_db:
+        if conn_db:
+            try:
                 conn_db.close()
-        except Exception:
-            pass
+            except Exception:
+                pass
 
-    # Publish job id to RabbitMQ jobs queue
-    queue_name = os.getenv("BACKFILL_JOBS_QUEUE", "backfill_jobs_queue")
-    host = os.getenv("RABBITMQ_HOST", "localhost")
-    port = int(os.getenv("RABBITMQ_PORT", "5672"))
-    user = os.getenv("RABBITMQ_USER", "guest")
-    password = os.getenv("RABBITMQ_PASSWORD", "guest")
+    # Step 6: Publish sub-job IDs to RabbitMQ
+    if sub_job_ids:
+        queue_name = os.getenv("BACKFILL_JOBS_QUEUE", "backfill_jobs_queue")
+        rmq_host = os.getenv("RABBITMQ_HOST", "localhost")
+        rmq_port = int(os.getenv("RABBITMQ_PORT", "5672"))
+        rmq_user = os.getenv("RABBITMQ_USER", "guest")
+        rmq_password = os.getenv("RABBITMQ_PASSWORD", "guest")
 
-    try:
-        creds = pika.PlainCredentials(user, password)
-        params = pika.ConnectionParameters(
-            host=host,
-            port=port,
-            credentials=creds,
-            heartbeat=int(os.getenv("RABBITMQ_HEARTBEAT", "30")),
-            blocked_connection_timeout=int(os.getenv("RABBITMQ_BLOCKED_TIMEOUT", "60")),
-            connection_attempts=1,
-            retry_delay=0,
-            client_properties={"connection_name": "api-service-backfill-publisher"},
-        )
-        conn = pika.BlockingConnection(params)
-        ch = conn.channel()
-        ch.queue_declare(queue=queue_name, durable=True)
-        payload = {"job_id": str(job_id)}
-        body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-        props = pika.BasicProperties(content_type="application/json", delivery_mode=2)
-        ch.basic_publish(exchange="", routing_key=queue_name, body=body, properties=props, mandatory=False)
         try:
-            ch.close()
-        except Exception:
-            pass
-        try:
-            conn.close()
-        except Exception:
-            pass
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Failed to enqueue backfill job: {str(e)}")
+            creds = pika.PlainCredentials(rmq_user, rmq_password)
+            params = pika.ConnectionParameters(
+                host=rmq_host,
+                port=rmq_port,
+                credentials=creds,
+                heartbeat=int(os.getenv("RABBITMQ_HEARTBEAT", "30")),
+                blocked_connection_timeout=int(os.getenv("RABBITMQ_BLOCKED_TIMEOUT", "60")),
+                connection_attempts=1,
+                retry_delay=0,
+                client_properties={"connection_name": "api-service-backfill-publisher"},
+            )
+            conn = pika.BlockingConnection(params)
+            ch = conn.channel()
+            ch.queue_declare(queue=queue_name, durable=True)
+            
+            # Publish each sub-job ID
+            for sub_job_id in sub_job_ids:
+                payload = {"sub_job_id": sub_job_id}
+                body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+                props = pika.BasicProperties(content_type="application/json", delivery_mode=2)
+                ch.basic_publish(exchange="", routing_key=queue_name, body=body, properties=props, mandatory=False)
+            
+            try:
+                ch.close()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+                
+        except Exception as e:
+            logger.exception("Failed to publish sub-jobs to RabbitMQ")
+            raise HTTPException(status_code=503, detail=f"Failed to enqueue sub-jobs: {str(e)}")
 
-    return {"job_id": str(job_id)}
+    return {
+        "master_job_id": str(master_job_id),
+        "ticker": job.ticker,
+        "provider": job.provider,
+        "start_date": job.start_date,
+        "end_date": job.end_date,
+        "gaps_found": len(gaps),
+        "sub_jobs_created": total_sub_jobs,
+        "message": final_message,
+        "planned_ranges": [f"{start} to {end}" for start, end in gaps]
+    }
 
 
+class SubJobStatusResponse(BaseModel):
+    """Status representation for a sub-job."""
+    
+    id: str
+    start_date: str
+    end_date: str
+    status: str
+    submitted_at: Optional[str] = None
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    error_message: Optional[str] = None
+    records_published: int = 0
+
+class MasterJobStatusResponse(BaseModel):
+    """Status representation for a master backfill job."""
+
+    id: str
+    ticker: str
+    provider: str
+    start_date: str
+    end_date: str
+    status: str
+    submitted_at: Optional[str] = None
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    error_message: Optional[str] = None
+    total_sub_jobs: int = 0
+    message: Optional[str] = None
+
+class DetailedMasterJobResponse(BaseModel):
+    """Detailed view of a master job with all its sub-jobs."""
+    
+    master_job: MasterJobStatusResponse
+    sub_jobs: List[SubJobStatusResponse]
+    progress_summary: Dict[str, int]  # e.g., {"PENDING": 2, "COMPLETED": 5, "FAILED": 1}
+
+class MasterJobListResponse(BaseModel):
+    """List response for master jobs."""
+    
+    jobs: List[MasterJobStatusResponse]
+    total_count: int
+
+# Legacy response model for backwards compatibility
 class BackfillJobStatusResponse(BaseModel):
-    """Status representation for a submitted backfill job."""
+    """Status representation for a submitted backfill job (legacy)."""
 
     id: str
     ticker: str
@@ -527,11 +730,65 @@ class BackfillJobStatusResponse(BaseModel):
     completed_at: Optional[str] = None
     error_message: Optional[str] = None
 
+@app.get("/v1/backfill/jobs", response_model=MasterJobListResponse)
+async def list_master_backfill_jobs(limit: int = Query(default=50, ge=1, le=200)):
+    """List all master backfill jobs with pagination."""
+    db_host = os.getenv("DB_HOST", "localhost")
+    db_port = int(os.getenv("DB_PORT", "5432"))
+    db_name = os.getenv("DB_NAME", "finbase")
+    db_user = os.getenv("DB_USER", "finbase")
+    db_password = os.getenv("DB_PASSWORD", "supersecretpassword")
 
-@app.get("/v1/backfill/jobs/{job_id}", response_model=BackfillJobStatusResponse)
-async def get_backfill_job_status(job_id: str):
-    """Look up the current status of a backfill job by id."""
-    # Sync query via psycopg2 for simplicity
+    conn_db = None
+    try:
+        conn_db = psycopg2.connect(host=db_host, port=db_port, dbname=db_name, user=db_user, password=db_password)
+        with conn_db.cursor() as cur:
+            # Get master jobs ordered by most recent first
+            cur.execute(
+                "SELECT id, ticker, provider, start_date, end_date, status, submitted_at, started_at, completed_at, "
+                "error_message, total_sub_jobs, message FROM master_backfill_jobs "
+                "ORDER BY submitted_at DESC LIMIT %s",
+                (limit,)
+            )
+            rows = cur.fetchall()
+            
+            # Get total count
+            cur.execute("SELECT COUNT(*) FROM master_backfill_jobs")
+            total_count = cur.fetchone()[0]
+            
+            jobs = []
+            for row in rows:
+                id_v, ticker, provider, sd, ed, status_v, sub_at, st_at, comp_at, err, total_sub, msg = row
+                jobs.append(MasterJobStatusResponse(
+                    id=str(id_v),
+                    ticker=ticker,
+                    provider=provider,
+                    start_date=sd.isoformat(),
+                    end_date=ed.isoformat(),
+                    status=status_v,
+                    submitted_at=sub_at.isoformat() if sub_at else None,
+                    started_at=st_at.isoformat() if st_at else None,
+                    completed_at=comp_at.isoformat() if comp_at else None,
+                    error_message=err,
+                    total_sub_jobs=total_sub or 0,
+                    message=msg
+                ))
+            
+            return MasterJobListResponse(jobs=jobs, total_count=total_count)
+            
+    except Exception as e:
+        logger.exception("Failed to list master jobs")
+        raise HTTPException(status_code=503, detail=f"Failed to query jobs: {str(e)}")
+    finally:
+        if conn_db:
+            try:
+                conn_db.close()
+            except Exception:
+                pass
+
+@app.get("/v1/backfill/jobs/{job_id}", response_model=DetailedMasterJobResponse)
+async def get_detailed_backfill_job_status(job_id: str):
+    """Get detailed status of a master job including all its sub-jobs."""
     db_host = os.getenv("DB_HOST", "localhost")
     db_port = int(os.getenv("DB_PORT", "5432"))
     db_name = os.getenv("DB_NAME", "finbase")
@@ -548,15 +805,18 @@ async def get_backfill_job_status(job_id: str):
     try:
         conn_db = psycopg2.connect(host=db_host, port=db_port, dbname=db_name, user=db_user, password=db_password)
         with conn_db.cursor() as cur:
+            # Get master job details
             cur.execute(
-                "SELECT id, ticker, provider, start_date, end_date, status, submitted_at, started_at, completed_at, error_message FROM backfill_jobs WHERE id = %s",
-                (job_id,),
+                "SELECT id, ticker, provider, start_date, end_date, status, submitted_at, started_at, completed_at, "
+                "error_message, total_sub_jobs, message FROM master_backfill_jobs WHERE id = %s",
+                (job_id,)
             )
-            row = cur.fetchone()
-            if not row:
-                raise HTTPException(status_code=404, detail="Job not found")
-            id_v, ticker, provider, sd, ed, status_v, sub_at, st_at, comp_at, err = row
-            resp = BackfillJobStatusResponse(
+            master_row = cur.fetchone()
+            if not master_row:
+                raise HTTPException(status_code=404, detail="Master job not found")
+            
+            id_v, ticker, provider, sd, ed, status_v, sub_at, st_at, comp_at, err, total_sub, msg = master_row
+            master_job = MasterJobStatusResponse(
                 id=str(id_v),
                 ticker=ticker,
                 provider=provider,
@@ -567,18 +827,56 @@ async def get_backfill_job_status(job_id: str):
                 started_at=st_at.isoformat() if st_at else None,
                 completed_at=comp_at.isoformat() if comp_at else None,
                 error_message=err,
+                total_sub_jobs=total_sub or 0,
+                message=msg
             )
-            return resp
+            
+            # Get all sub-jobs for this master job
+            cur.execute(
+                "SELECT id, start_date, end_date, status, submitted_at, started_at, completed_at, "
+                "error_message, records_published FROM sub_backfill_jobs WHERE master_job_id = %s "
+                "ORDER BY start_date ASC",
+                (job_id,)
+            )
+            sub_rows = cur.fetchall()
+            
+            sub_jobs = []
+            progress_summary = {}
+            
+            for sub_row in sub_rows:
+                sub_id, sub_sd, sub_ed, sub_status, sub_sub_at, sub_st_at, sub_comp_at, sub_err, sub_records = sub_row
+                sub_jobs.append(SubJobStatusResponse(
+                    id=str(sub_id),
+                    start_date=sub_sd.isoformat(),
+                    end_date=sub_ed.isoformat(),
+                    status=sub_status,
+                    submitted_at=sub_sub_at.isoformat() if sub_sub_at else None,
+                    started_at=sub_st_at.isoformat() if sub_st_at else None,
+                    completed_at=sub_comp_at.isoformat() if sub_comp_at else None,
+                    error_message=sub_err,
+                    records_published=sub_records or 0
+                ))
+                
+                # Count statuses for progress summary
+                progress_summary[sub_status] = progress_summary.get(sub_status, 0) + 1
+            
+            return DetailedMasterJobResponse(
+                master_job=master_job,
+                sub_jobs=sub_jobs,
+                progress_summary=progress_summary
+            )
+            
     except HTTPException:
         raise
     except Exception as e:
+        logger.exception("Failed to get detailed job status")
         raise HTTPException(status_code=503, detail=f"Failed to query job: {str(e)}")
     finally:
-        try:
-            if conn_db:
+        if conn_db:
+            try:
                 conn_db.close()
-        except Exception:
-            pass
+            except Exception:
+                pass
 
 @app.get("/v1/data/history/{ticker}", response_model=HistoryResponse)
 async def get_history(

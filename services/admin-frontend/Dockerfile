@@ -46,10 +46,12 @@ server {
         index index.html;
         try_files \$uri \$uri/ /index.html;
         
-        # Cache static assets
+        # Disable cache for development
         location ~* \.(css|js|png|jpg|jpeg|gif|ico|svg)$ {
-            expires 1d;
-            add_header Cache-Control "public, immutable";
+            expires -1;
+            add_header Cache-Control "no-cache, no-store, must-revalidate";
+            add_header Pragma "no-cache";
+            add_header Expires "0";
         }
     }
 
