@@ -9,7 +9,7 @@ class AdminPanel {
         
         this.initializeElements();
         this.attachEventListeners();
-        this.initializeApp();
+        this.initializeAppWithRetries();
     }
 
     initializeElements() {
@@ -92,6 +92,42 @@ class AdminPanel {
         }
     }
 
+    async initializeAppWithRetries(maxRetries = 3, delayMs = 2000) {
+        // Perform the same initialization, but retry connection a few times
+        // Set defaults first
+        const endDate = new Date();
+        const startDate = new Date();
+        startDate.setDate(startDate.getDate() - 30);
+        this.startDateInput.value = startDate.toISOString().split('T')[0];
+        this.endDateInput.value = endDate.toISOString().split('T')[0];
+
+        const savedApiKey = localStorage.getItem('finbase_admin_api_key');
+        if (savedApiKey) {
+            this.apiKeyInput.value = savedApiKey;
+        }
+
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            const ok = await this.checkApiConnection();
+            if (ok) {
+                await this.refreshJobs();
+                if (this.autoRefreshCheckbox.checked) {
+                    this.startAutoRefresh();
+                }
+                return;
+            }
+            if (attempt < maxRetries) {
+                this.showStatusMessage('error', `API not reachable (attempt ${attempt}/${maxRetries}). Retrying...`);
+                await this.sleep(delayMs);
+            }
+        }
+        // After final failure, show a persistent message
+        this.showStatusMessage('error', 'API is unavailable after multiple attempts. Please verify backend services and retry.', true);
+    }
+
+    sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
     async checkApiConnection() {
         try {
             this.updateConnectionStatus('checking', 'Checking API connection...');
@@ -103,12 +139,15 @@ class AdminPanel {
 
             if (response.ok) {
                 this.updateConnectionStatus('connected', 'API Connected');
+                return true;
             } else {
                 this.updateConnectionStatus('error', 'API Error');
+                return false;
             }
         } catch (error) {
             this.updateConnectionStatus('error', 'API Unavailable');
             console.error('API connection check failed:', error);
+            return false;
         }
     }
 
@@ -214,19 +253,21 @@ class AdminPanel {
         }
     }
 
-    showStatusMessage(type, message) {
+    showStatusMessage(type, message, persist = false) {
         const messageElement = document.createElement('div');
         messageElement.className = `status-message status-${type} fade-in`;
         messageElement.textContent = message;
         
         this.statusMessages.appendChild(messageElement);
         
-        // Auto-remove after 5 seconds
-        setTimeout(() => {
-            if (messageElement.parentNode) {
-                messageElement.remove();
-            }
-        }, 5000);
+        if (!persist) {
+            // Auto-remove after 5 seconds
+            setTimeout(() => {
+                if (messageElement.parentNode) {
+                    messageElement.remove();
+                }
+            }, 5000);
+        }
     }
 
     clearStatusMessages() {

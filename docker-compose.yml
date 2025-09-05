@@ -39,6 +39,10 @@ services:
       timeout: 5s
       retries: 5
 
+  # NOTE: The collector_service runs in parallel to the backfill worker, fetching live data.
+  # For isolated backfilling tests, you can temporarily comment out this entire service
+  # block to prevent live data from being ingested. This provides a clean environment
+  # to test backfill jobs without interference.
   collector_service:
     build:
       context: ./services/collector-yfinance
@@ -69,8 +73,15 @@ services:
       INPUT_QUEUE: raw_data_queue
       VALID_QUEUE: clean_data_queue
       INVALID_QUEUE: invalid_data_queue
+      DB_HOST: finbase-db
+      DB_PORT: 5432
+      DB_NAME: finbase
+      DB_USER: finbase
+      DB_PASSWORD: supersecretpassword
     depends_on:
       rabbitmq:
+        condition: service_healthy
+      finbase-db:
         condition: service_healthy
 
   storage_service:
@@ -114,6 +125,12 @@ services:
       RABBITMQ_PASSWORD: guest
       RABBITMQ_DATA_EVENTS_EXCHANGE: data_events
       BACKFILL_API_KEY: "FINBASE_ADMIN_KEY_abc123xyz"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
     depends_on:
       rabbitmq:
         condition: service_healthy
@@ -140,7 +157,7 @@ services:
       - "8081:80"
     depends_on:
       api-service:
-        condition: service_started
+        condition: service_healthy
     environment:
       - NGINX_HOST=localhost
       - NGINX_PORT=80
@@ -157,6 +174,8 @@ services:
       context: ./services/backfill-worker-service
       dockerfile: Dockerfile
     container_name: backfill-worker-service
+    env_file:
+      - ./services/backfill-worker-service/.env.backfill
     environment:
       RABBITMQ_HOST: rabbitmq
       RABBITMQ_PORT: 5672

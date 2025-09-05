@@ -26,7 +26,7 @@ import random
 import signal
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from threading import Event
 from typing import Any, Callable, Dict, Iterable, Tuple
 
@@ -37,6 +37,7 @@ import psycopg2
 
 # Providers
 from providers.yfinance_provider import fetch_yfinance
+from providers.alpaca_provider import fetch_alpaca
 
 # Logging (UTC ISO timestamps)
 logging.Formatter.converter = time.gmtime
@@ -182,6 +183,7 @@ def dispatch_provider(job: dict, cfg: Dict[str, Any]) -> Iterable[dict]:
     # Provider registry
     providers: Dict[str, Callable[..., Iterable[dict]]] = {
         "yfinance": fetch_yfinance,
+        "alpaca": fetch_alpaca,
     }
 
     fn = providers.get(provider)
@@ -269,24 +271,115 @@ def process_job(cfg: Dict[str, Any], channel, method, properties, body: bytes) -
 
                 sub_id, master_job_id, ticker, provider, start_date, end_date = row
                 
+                # Determine providers to try (primary + fallbacks)
+                providers_to_try = []
+                primary_provider = msg.get("primary_provider")
+                fallback_providers = msg.get("fallback_providers") or []
+                if primary_provider:
+                    providers_to_try = [str(primary_provider).lower()] + [str(p).lower() for p in fallback_providers if p]
+                else:
+                    providers_to_try = [str(provider).lower()]
+                
                 # Mark sub-job as RUNNING
                 cur.execute(
                     "UPDATE sub_backfill_jobs SET status='RUNNING', started_at=NOW() WHERE id = %s",
                     (sub_job_id,),
                 )
                 
-                job = {
-                    "ticker": ticker,
-                    "provider": provider,
-                    "start_date": start_date.isoformat(),
-                    "end_date": end_date.isoformat(),
-                }
+                success = False
+                last_error = None
+                total_published_any = 0
                 
-                # Process the sub-job
-                for record in dispatch_provider(job, cfg):
-                    publish_raw(channel, cfg["RAW_QUEUE_NAME"], record)
-                    records_published += 1
-
+                for prov in providers_to_try:
+                    # Build job for this attempt
+                    job = {
+                        "ticker": ticker,
+                        "provider": prov,
+                        "start_date": start_date.isoformat(),
+                        "end_date": end_date.isoformat(),
+                    }
+                    
+                    # Bump total_requests and last_seen_active for this provider
+                    try:
+                        with db_conn.cursor() as currep:
+                            currep.execute(
+                                """
+                                INSERT INTO provider_reputation (provider_name, total_requests, last_seen_active)
+                                VALUES (%s, 1, NOW())
+                                ON CONFLICT (provider_name) DO UPDATE SET
+                                    total_requests = provider_reputation.total_requests + 1,
+                                    last_seen_active = NOW()
+                                """,
+                                (prov,)
+                            )
+                    except Exception:
+                        logger.exception("Failed to bump total_requests for provider=%s", prov)
+                    
+                    records_this_attempt = 0
+                    try:
+                        for record in dispatch_provider(job, cfg):
+                            # Ensure provider metadata is present
+                            try:
+                                md = record.setdefault("metadata", {})
+                                if not md.get("provider"):
+                                    md["provider"] = prov
+                            except Exception:
+                                pass
+                            publish_raw(channel, cfg["RAW_QUEUE_NAME"], record)
+                            records_published += 1
+                            records_this_attempt += 1
+                        # Success for this provider
+                        total_published_any += records_this_attempt
+                        try:
+                            with db_conn.cursor() as currep2:
+                                currep2.execute(
+                                    """
+                                    INSERT INTO provider_reputation (provider_name, successful_requests, total_records_published, last_seen_active)
+                                    VALUES (%s, 1, %s, NOW())
+                                    ON CONFLICT (provider_name) DO UPDATE SET
+                                        successful_requests = provider_reputation.successful_requests + 1,
+                                        total_records_published = provider_reputation.total_records_published + EXCLUDED.total_records_published,
+                                        last_seen_active = NOW()
+                                    """,
+                                    (prov, records_this_attempt)
+                                )
+                        except Exception:
+                            logger.exception("Failed to bump success metrics for provider=%s", prov)
+                        success = True
+                        break
+                    except Exception as e_attempt:
+                        last_error = str(e_attempt)
+                        logger.exception("Provider attempt failed for provider=%s sub_job_id=%s", prov, sub_job_id)
+                        # Bump failed_requests
+                        try:
+                            with db_conn.cursor() as currep3:
+                                currep3.execute(
+                                    """
+                                    INSERT INTO provider_reputation (provider_name, failed_requests, last_seen_active)
+                                    VALUES (%s, 1, NOW())
+                                    ON CONFLICT (provider_name) DO UPDATE SET
+                                        failed_requests = provider_reputation.failed_requests + 1,
+                                        last_seen_active = NOW()
+                                    """,
+                                    (prov,)
+                                )
+                        except Exception:
+                            logger.exception("Failed to bump failed_requests for provider=%s", prov)
+                        # Try next fallback provider
+                        continue
+                
+                if not success:
+                    # All providers failed
+                    try:
+                        cur.execute(
+                            "UPDATE sub_backfill_jobs SET status='FAILED', completed_at=NOW(), error_message=%s WHERE id = %s",
+                            (last_error or "All providers failed", sub_job_id),
+                        )
+                    except Exception:
+                        logger.exception("Failed to set sub-job FAILED for sub_job_id=%s", sub_job_id)
+                    channel.basic_ack(delivery_tag=method.delivery_tag)
+                    return
+                
                 # Wait for persistence if applicable
                 try:
                     if job.get("ticker") and (cfg.get("BACKFILL_INTERVAL") == "1d" or str(job.get("ticker")).upper().startswith("TEST.")):

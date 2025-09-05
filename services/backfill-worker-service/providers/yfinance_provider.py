@@ -76,6 +76,7 @@ def _generate_synthetic_daily(ticker: str, start_date: str, end_date: str) -> It
             "volume": v,
             "metadata": {
                 "source": "synthetic",
+                "provider": "yfinance",
                 "granularity": "1d",
             },
         }
@@ -154,6 +155,7 @@ def fetch_yfinance(
                     "volume": int(row["Volume"]) if not (row["Volume"] != row["Volume"]) else 0,
                     "metadata": {
                         "source": "yfinance",
+                        "provider": "yfinance",
                         "granularity": interval,
                     },
                 }

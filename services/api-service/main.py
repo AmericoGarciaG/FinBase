@@ -41,6 +41,11 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
 
 app = FastAPI(title="FinBase API", version="0.2.0")
 
+# Simple health endpoint for container health checks and orchestration
+@app.get("/health")
+async def health():
+    return {"status": "healthy"}
+
 # Security: API Key required for backfill job creation
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
@@ -130,7 +135,7 @@ class BackfillJobRequest(BaseModel):
     """Request body for creating a backfill job."""
 
     ticker: str
-    provider: Literal["yfinance"]
+    provider: Literal["yfinance", "alpaca", "automatic"] = "automatic"
     start_date: str  # YYYY-MM-DD
     end_date: str    # YYYY-MM-DD
     interval: Optional[Literal["1d", "1h", "1m"]] = None
@@ -535,7 +540,7 @@ async def create_backfill_job(job: BackfillJobRequest = Body(...), _: bool = Dep
         conn_db.autocommit = True
         
         with conn_db.cursor() as cur:
-            # Step 1: Query existing coverage for this ticker/provider
+            # Step 1: Query existing coverage for this ticker/provider (for 'automatic', this is tracked under 'automatic')
             cur.execute(
                 "SELECT start_date, end_date FROM sub_backfill_jobs "
                 "WHERE ticker = %s AND provider = %s AND status IN ('PENDING', 'RUNNING', 'COMPLETED')",
@@ -624,6 +629,58 @@ async def create_backfill_job(job: BackfillJobRequest = Body(...), _: bool = Dep
         rmq_user = os.getenv("RABBITMQ_USER", "guest")
         rmq_password = os.getenv("RABBITMQ_PASSWORD", "guest")
 
+        # Determine provider selection (automatic vs specific)
+        primary_provider = None
+        fallback_providers: List[str] = []
+
+        if job.provider == "automatic":
+            # Compute scores from provider_reputation
+            try:
+                rep_rows: List[Tuple[str, int, int, int, int, int, Optional[str]]] = []
+                conn_db2 = psycopg2.connect(host=db_host, port=db_port, dbname=db_name, user=db_user, password=db_password)
+                try:
+                    with conn_db2.cursor() as cur2:
+                        cur2.execute(
+                            "SELECT provider_name, total_requests, successful_requests, failed_requests, data_quality_issues, total_records_published, last_seen_active FROM provider_reputation"
+                        )
+                        rep_rows = cur2.fetchall()
+                finally:
+                    try:
+                        conn_db2.close()
+                    except Exception:
+                        pass
+                scores: Dict[str, float] = {}
+                providers_set: set[str] = set()
+                for r in rep_rows:
+                    name, total, ok, fail, dq, total_pub, _ = r
+                    providers_set.add(name)
+                    # Availability: ok/total (default 0.5 if no data)
+                    availability = (float(ok) / float(total)) if (total or 0) > 0 else 0.5
+                    # Quality: 1 - (dq / total_pub) (default 0.5 if no data)
+                    quality = 1.0 - ((float(dq) / float(total_pub)) if (total_pub or 0) > 0 else 0.5)
+                    if quality < 0.0:
+                        quality = 0.0
+                    if quality > 1.0:
+                        quality = 1.0
+                    score = (availability * 70.0) + (quality * 30.0)
+                    scores[name] = score
+                if not providers_set:
+                    # Default to known providers if no reputation yet
+                    providers_set = {"yfinance", "alpaca"}
+                    scores = {p: 50.0 for p in providers_set}
+                # Randomly select primary among available providers
+                import random as _random
+                primary_provider = _random.choice(sorted(list(providers_set)))
+                # Fallbacks: others sorted by score descending
+                fallback_providers = [p for p in sorted(providers_set, key=lambda x: scores.get(x, 0.0), reverse=True) if p != primary_provider]
+            except Exception as e:
+                logger.exception("Failed to compute provider selection; defaulting to yfinance primary")
+                primary_provider = "yfinance"
+                fallback_providers = ["alpaca"]
+        else:
+            primary_provider = job.provider
+            fallback_providers = []
+
         try:
             creds = pika.PlainCredentials(rmq_user, rmq_password)
             params = pika.ConnectionParameters(
@@ -640,9 +697,13 @@ async def create_backfill_job(job: BackfillJobRequest = Body(...), _: bool = Dep
             ch = conn.channel()
             ch.queue_declare(queue=queue_name, durable=True)
             
-            # Publish each sub-job ID
+            # Publish each sub-job ID with provider selection
             for sub_job_id in sub_job_ids:
-                payload = {"sub_job_id": sub_job_id}
+                payload = {
+                    "sub_job_id": sub_job_id,
+                    "primary_provider": primary_provider,
+                    "fallback_providers": fallback_providers,
+                }
                 body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
                 props = pika.BasicProperties(content_type="application/json", delivery_mode=2)
                 ch.basic_publish(exchange="", routing_key=queue_name, body=body, properties=props, mandatory=False)

@@ -94,6 +94,21 @@ docker cp ./tests api-service:/tmp/
 docker exec api-service python -m pytest -v /tmp/tests/
 ```
 
+## 🧪 Testing & Development Notes
+
+### Understanding Data Flows
+
+FinBase operates with two parallel data ingestion flows, which is the intended design for a production-like environment:
+
+1.  **Live Stream (`collector_service`):** This service runs continuously, fetching the latest 1-minute candle for the tickers defined in its configuration. It represents the "live pulse" of the market.
+2.  **Historical Backfill (`backfill_worker`):** This service runs on-demand jobs to fill large historical data gaps.
+
+### How to Run Isolated Backfill Tests
+
+During development, you may want to test the backfilling process without interference from the live data collector. The recommended way to achieve this is to **temporarily disable the live collector**.
+
+To do this, simply **comment out the entire `collector_service` block** in the main `docker-compose.yml` file before running `docker compose up`.
+
 ## 🗺️ Project Roadmap
 
 ### ✅ Phase 1: Core System & Intelligent Job Management (Completed)

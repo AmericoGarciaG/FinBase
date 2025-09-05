@@ -86,3 +86,14 @@ CREATE INDEX IF NOT EXISTS idx_sub_backfill_jobs_status ON sub_backfill_jobs (st
 CREATE INDEX IF NOT EXISTS idx_sub_backfill_jobs_master_id ON sub_backfill_jobs (master_job_id);
 CREATE INDEX IF NOT EXISTS idx_sub_backfill_jobs_ticker_provider ON sub_backfill_jobs (ticker, provider);
 CREATE INDEX IF NOT EXISTS idx_sub_backfill_jobs_date_range ON sub_backfill_jobs (ticker, provider, start_date, end_date);
+
+-- Provider reputation table for intelligent provider selection and scoring
+CREATE TABLE IF NOT EXISTS provider_reputation (
+    provider_name TEXT PRIMARY KEY,
+    total_requests BIGINT DEFAULT 0,
+    successful_requests BIGINT DEFAULT 0,
+    failed_requests BIGINT DEFAULT 0,
+    data_quality_issues BIGINT DEFAULT 0,
+    total_records_published BIGINT DEFAULT 0,
+    last_seen_active TIMESTAMPTZ NULL
+);

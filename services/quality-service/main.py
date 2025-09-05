@@ -27,6 +27,7 @@ from typing import Optional, Tuple
 import pika
 from pika.exceptions import AMQPConnectionError, ChannelClosedByBroker, StreamLostError
 from dotenv import load_dotenv
+import psycopg2
 
 from rules import validate_data
 
@@ -40,6 +41,9 @@ logging.basicConfig(
 logger = logging.getLogger("quality-service")
 
 stop_event = Event()
+
+# Global DB connection
+_db_conn = None
 
 
 def load_config():
@@ -164,6 +168,37 @@ def publish_json(channel, queue_name: str, message: dict) -> None:
     publish_raw(channel, queue_name, payload)
 
 
+def _connect_db() -> psycopg2.extensions.connection:
+    host = os.getenv("DB_HOST", "localhost")
+    port = int(os.getenv("DB_PORT", "5432"))
+    db = os.getenv("DB_NAME", "finbase")
+    user = os.getenv("DB_USER", "finbase")
+    password = os.getenv("DB_PASSWORD", "supersecretpassword")
+    conn = psycopg2.connect(host=host, port=port, dbname=db, user=user, password=password)
+    conn.autocommit = True
+    return conn
+
+
+def _bump_quality_issue(provider_name: str) -> None:
+    global _db_conn
+    try:
+        if _db_conn is None or getattr(_db_conn, "closed", 1):
+            _db_conn = _connect_db()
+        with _db_conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO provider_reputation (provider_name, data_quality_issues, last_seen_active)
+                VALUES (%s, 1, NOW())
+                ON CONFLICT (provider_name) DO UPDATE SET
+                    data_quality_issues = provider_reputation.data_quality_issues + 1,
+                    last_seen_active = NOW()
+                """,
+                (provider_name,)
+            )
+    except Exception:
+        logger.exception("Failed to bump data_quality_issues for provider=%s", provider_name)
+
+
 def process_message(cfg, channel, method, properties, body: bytes):
     """Process a consumed message.
 
@@ -200,6 +235,14 @@ def process_message(cfg, channel, method, properties, body: bytes):
                 cfg["VALID_QUEUE"], data.get("ticker_symbol"), data.get("timestamp_utc")
             )
         else:
+            # Attempt to extract provider from metadata and update reputation
+            try:
+                meta = (data or {}).get("metadata") or {}
+                provider_name = meta.get("provider") or meta.get("source")
+                if provider_name:
+                    _bump_quality_issue(str(provider_name))
+            except Exception:
+                logger.exception("Failed to update provider reputation for invalid message")
             invalid_msg = {"original_message": body_str, "validation_error": reason}
             publish_json(channel, cfg["INVALID_QUEUE"], invalid_msg)
             channel.basic_ack(delivery_tag=method.delivery_tag)
@@ -238,6 +281,14 @@ def run():
     backoff_attempt = 0
     connection = None
     channel = None
+
+    # Connect to DB on startup (best-effort)
+    global _db_conn
+    try:
+        _db_conn = _connect_db()
+        logger.info("Connected to DB for quality feedback updates")
+    except Exception as e:
+        logger.error("Failed to connect to DB on startup: %s (will retry on first use)", str(e))
 
     while not stop_event.is_set():
         try:
