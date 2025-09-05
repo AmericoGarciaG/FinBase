@@ -126,11 +126,11 @@ services:
       RABBITMQ_DATA_EVENTS_EXCHANGE: data_events
       BACKFILL_API_KEY: "FINBASE_ADMIN_KEY_abc123xyz"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 15s
+      test: ["CMD", "curl", "-f", "http://localhost:8000/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 45s
     depends_on:
       rabbitmq:
         condition: service_healthy

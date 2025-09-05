@@ -387,10 +387,227 @@ def run():
         logger.info("Collector shut down cleanly.")
 
 
+import threading
+
+
+class YFinanceCollector:
+    """YFinance collector with remote pause/resume control via RabbitMQ."""
+
+    def __init__(self) -> None:
+        self.cfg = load_config()
+        self.is_paused = False
+        # Reuse the global stop_event for existing helpers
+        self.stop_event = stop_event
+        self._control_thread: Optional[threading.Thread] = None
+
+    def _start_control_consumer(self) -> None:
+        """Start a background thread consuming collector control commands.
+
+        Binds an exclusive anonymous queue to the 'collector_control' fanout exchange and
+        toggles self.is_paused based on incoming messages.
+        """
+        exchange_name = os.getenv("RABBITMQ_COLLECTOR_CONTROL_EXCHANGE", "collector_control")
+
+        def _thread_func():
+            credentials = pika.PlainCredentials(self.cfg["RABBITMQ_USER"], self.cfg["RABBITMQ_PASSWORD"])
+            params = pika.ConnectionParameters(
+                host=self.cfg["RABBITMQ_HOST"],
+                port=self.cfg["RABBITMQ_PORT"],
+                credentials=credentials,
+                heartbeat=self.cfg["RABBITMQ_HEARTBEAT"],
+                blocked_connection_timeout=self.cfg["RABBITMQ_BLOCKED_TIMEOUT"],
+                connection_attempts=1,
+                retry_delay=0,
+                client_properties={"connection_name": "collector-yfinance-control"},
+            )
+
+            conn = None
+            ch = None
+            while not self.stop_event.is_set():
+                try:
+                    conn = pika.BlockingConnection(params)
+                    ch = conn.channel()
+                    ch.exchange_declare(exchange=exchange_name, exchange_type="fanout", durable=True)
+                    q = ch.queue_declare(queue="", exclusive=True, auto_delete=True)
+                    qname = q.method.queue
+                    ch.queue_bind(exchange=exchange_name, queue=qname)
+
+                    logger.info("Control consumer connected. Waiting for pause/resume commands...")
+                    for method, properties, body in ch.consume(qname, inactivity_timeout=0.5, auto_ack=True):
+                        if self.stop_event.is_set():
+                            break
+                        if method is None:
+                            continue
+                        try:
+                            payload = json.loads(body or b"{}")
+                            cmd = str(payload.get("command", "")).lower()
+                            if cmd == "pause":
+                                if not self.is_paused:
+                                    logger.warning("Received PAUSE command. Pausing data collection.")
+                                self.is_paused = True
+                            elif cmd == "resume":
+                                if self.is_paused:
+                                    logger.warning("Received RESUME command. Resuming data collection.")
+                                self.is_paused = False
+                        except Exception as e:
+                            logger.error("Invalid control message: %s", str(e))
+                    try:
+                        ch.cancel()
+                    except Exception:
+                        pass
+                    try:
+                        ch.close()
+                    except Exception:
+                        pass
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                except Exception as e:
+                    logger.error("Control consumer error: %s (will retry)", str(e))
+                    # Simple backoff
+                    self.stop_event.wait(1.0)
+            # Final cleanup (if any open)
+            try:
+                if ch and ch.is_open:
+                    ch.close()
+            except Exception:
+                pass
+            try:
+                if conn and conn.is_open:
+                    conn.close()
+            except Exception:
+                pass
+
+        self._control_thread = threading.Thread(target=_thread_func, name="collector-control-consumer", daemon=True)
+        self._control_thread.start()
+
+    def run(self) -> None:
+        # Register signal handlers for graceful shutdown
+        def _handle_signal(signum, frame):
+            logger.info("Received signal %s. Initiating graceful shutdown...", signum)
+            self.stop_event.set()
+
+        signal.signal(signal.SIGTERM, _handle_signal)
+        signal.signal(signal.SIGINT, _handle_signal)
+
+        connection = None
+        channel = None
+
+        try:
+            # Start control consumer thread
+            self._start_control_consumer()
+
+            connection, channel = connect_rabbitmq(self.cfg)
+
+            # Main loop: periodically fetch and publish for each ticker
+            logger.info("Starting data collection loop...")
+            consecutive_failures = 0
+
+            while not self.stop_event.is_set():
+                cycle_start = time.monotonic()
+                successful_fetches = 0
+
+                for i, ticker in enumerate(self.cfg["TICKERS"]):
+                    if self.stop_event.is_set():
+                        break
+
+                    # Pause gate before fetching data
+                    if self.is_paused:
+                        time.sleep(1)
+                        continue
+
+                    data = fetch_latest_candle(ticker)
+                    if data is None:
+                        # Add a small delay between failed requests to avoid hammering the API
+                        if i < len(self.cfg["TICKERS"]) - 1:  # Don't delay after the last ticker
+                            self.stop_event.wait(self.cfg["TICKER_DELAY_SECONDS"])
+                        continue
+
+                    successful_fetches += 1
+
+                    try:
+                        publish_json(channel, self.cfg["RAW_QUEUE_NAME"], data)
+                        logger.info(
+                            "Published %s @ %s to queue=%s",
+                            data["ticker_symbol"],
+                            data["timestamp_utc"],
+                            self.cfg["RAW_QUEUE_NAME"],
+                        )
+                    except (ChannelClosedByBroker, StreamLostError, AMQPConnectionError) as e:
+                        logger.error("Channel/connection error during publish: %s. Will attempt to reconnect.", str(e))
+                        # Close existing connection and reconnect
+                        try:
+                            if connection and not connection.is_closed:
+                                connection.close()
+                        except Exception:
+                            pass
+                        connection, channel = connect_rabbitmq(self.cfg)
+                        # Retry the publish after reconnection
+                        try:
+                            publish_json(channel, self.cfg["RAW_QUEUE_NAME"], data)
+                            logger.info(
+                                "Published %s @ %s to queue=%s (after reconnect)",
+                                data["ticker_symbol"],
+                                data["timestamp_utc"],
+                                self.cfg["RAW_QUEUE_NAME"],
+                            )
+                        except Exception as retry_e:
+                            logger.exception("Failed to publish after reconnection for %s: %s", ticker, str(retry_e))
+                    except Exception as e:
+                        logger.exception("Unexpected error during publish for %s: %s", ticker, str(e))
+
+                    # Add delay between ticker requests to respect rate limits
+                    if i < len(self.cfg["TICKERS"]) - 1:  # Don't delay after the last ticker
+                        self.stop_event.wait(self.cfg["TICKER_DELAY_SECONDS"])
+
+                # Handle consecutive failures with backoff
+                if successful_fetches == 0:
+                    consecutive_failures += 1
+                    if consecutive_failures >= 3:
+                        backoff_delay = self.cfg["RETRY_DELAY_SECONDS"]
+                        logger.warning(
+                            "No successful fetches in %d cycles. Backing off for %d seconds...",
+                            consecutive_failures,
+                            backoff_delay,
+                        )
+                        self.stop_event.wait(backoff_delay)
+                else:
+                    consecutive_failures = 0
+
+                # Sleep until next interval, with stop-aware wait
+                elapsed = time.monotonic() - cycle_start
+                remaining = max(0, self.cfg["FETCH_INTERVAL_SECONDS"] - elapsed)
+                if remaining > 0:
+                    logger.debug("Cycle completed in %.2fs, sleeping %.2fs until next cycle", elapsed, remaining)
+                    self.stop_event.wait(remaining)
+
+        finally:
+            # Attempt clean shutdown
+            logger.info("Shutting down connections...")
+            try:
+                if channel and not channel.is_closed:
+                    channel.close()
+            except Exception:
+                pass
+            try:
+                if connection and not connection.is_closed:
+                    connection.close()
+            except Exception:
+                pass
+            # Stop control thread
+            if self._control_thread and self._control_thread.is_alive():
+                try:
+                    self._control_thread.join(timeout=2.0)
+                except Exception:
+                    pass
+            logger.info("Collector shut down cleanly.")
+
+
 if __name__ == "__main__":
     try:
         logger.info("Starting FinBase YFinance Collector...")
-        run()
+        YFinanceCollector().run()
     except SystemExit as e:
         logger.info("Exiting: %s", str(e))
         sys.exit(0)

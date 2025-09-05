@@ -63,6 +63,16 @@ class AdminPanel {
         this.tickerInput.addEventListener('input', (e) => {
             e.target.value = e.target.value.toUpperCase().replace(/[^A-Z0-9.-]/g, '');
         });
+
+        // On page unload: attempt to resume collectors without API key using sendBeacon
+        window.addEventListener('beforeunload', () => {
+            try {
+                const blob = new Blob([JSON.stringify({})], { type: 'application/json' });
+                navigator.sendBeacon(`${this.apiBaseUrl}/collectors/resume`, blob);
+            } catch (e) {
+                // Ignore errors in unload handler
+            }
+        });
     }
 
     async initializeApp() {
@@ -92,7 +102,7 @@ class AdminPanel {
         }
     }
 
-    async initializeAppWithRetries(maxRetries = 3, delayMs = 2000) {
+    async initializeAppWithRetries(maxRetries = 6, delayMs = 2000) {
         // Perform the same initialization, but retry connection a few times
         // Set defaults first
         const endDate = new Date();
@@ -109,6 +119,26 @@ class AdminPanel {
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
             const ok = await this.checkApiConnection();
             if (ok) {
+                // Clear any previous error banners upon success
+                this.clearStatusMessages();
+
+                // After successful API connection, request collectors to pause (privileged)
+                try {
+                    const apiKey = localStorage.getItem('finbase_admin_api_key') || this.apiKeyInput.value;
+                    if (apiKey) {
+                        await fetch(`${this.apiBaseUrl}/collectors/pause`, {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'X-API-Key': apiKey
+                            },
+                            body: JSON.stringify({})
+                        });
+                    }
+                } catch (e) {
+                    console.warn('Failed to send pause command:', e);
+                }
+
                 await this.refreshJobs();
                 if (this.autoRefreshCheckbox.checked) {
                     this.startAutoRefresh();
@@ -116,12 +146,12 @@ class AdminPanel {
                 return;
             }
             if (attempt < maxRetries) {
-                this.showStatusMessage('error', `API not reachable (attempt ${attempt}/${maxRetries}). Retrying...`);
+                // Do not show a red banner yet; keep UI in 'checking' state and retry silently
                 await this.sleep(delayMs);
             }
         }
         // After final failure, show a persistent message
-        this.showStatusMessage('error', 'API is unavailable after multiple attempts. Please verify backend services and retry.', true);
+        this.showStatusMessage('error', 'API is unavailable or not ready after multiple attempts. Please verify backend services and retry.', true);
     }
 
     sleep(ms) {
@@ -132,16 +162,24 @@ class AdminPanel {
         try {
             this.updateConnectionStatus('checking', 'Checking API connection...');
             
-            const response = await fetch(`${this.apiBaseUrl}/backfill/jobs`, {
+            const response = await fetch(`${this.apiBaseUrl}/ready`, {
                 method: 'GET',
                 headers: { 'Content-Type': 'application/json' }
             });
 
             if (response.ok) {
-                this.updateConnectionStatus('connected', 'API Connected');
-                return true;
+                // If body has {ready:true} we mark connected
+                try {
+                    const body = await response.json();
+                    if (body && body.ready === true) {
+                        this.updateConnectionStatus('connected', 'API Connected');
+                        return true;
+                    }
+                } catch (_) { /* ignore parse issues */ }
+                this.updateConnectionStatus('error', 'API Not Ready');
+                return false;
             } else {
-                this.updateConnectionStatus('error', 'API Error');
+                this.updateConnectionStatus('error', 'API Not Ready');
                 return false;
             }
         } catch (error) {
@@ -810,7 +848,7 @@ class AdminPanel {
 
     clearCompletedJobs() {
         const completedJobs = Array.from(this.jobs.values())
-            .filter(job => job.status === 'COMPLETED' || job.status === 'FAILED');
+            .filter(job => job.status === 'COMPLETED' || job.status === 'FAILED' || job.status === 'PARTIALLY_COMPLETED');
         
         if (completedJobs.length === 0) {
             this.showStatusMessage('info', 'No completed jobs to clear');

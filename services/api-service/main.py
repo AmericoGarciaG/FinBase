@@ -28,6 +28,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, status, Depends, Security
 from fastapi import Body
 from fastapi.security.api_key import APIKeyHeader
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator
 import psycopg2
 import uuid
@@ -45,6 +46,29 @@ app = FastAPI(title="FinBase API", version="0.2.0")
 @app.get("/health")
 async def health():
     return {"status": "healthy"}
+
+
+@app.get("/ready")
+async def ready():
+    """Readiness probe: returns 200 only when DB and RabbitMQ listener are ready."""
+    # Check RabbitMQ listener status
+    rmq_ok = bool(getattr(app.state, "rmq_connected", False))
+
+    # Check DB connectivity
+    db_ok = False
+    try:
+        pool: asyncpg.Pool = app.state.pool
+        async with pool.acquire() as conn:
+            _ = await conn.fetchval("SELECT 1")
+            db_ok = True
+    except Exception:
+        db_ok = False
+
+    status_code = 200 if (rmq_ok and db_ok) else 503
+    return JSONResponse(
+        content={"ready": rmq_ok and db_ok, "db": db_ok, "rabbitmq": rmq_ok},
+        status_code=status_code,
+    )
 
 # Security: API Key required for backfill job creation
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
@@ -252,6 +276,8 @@ async def _start_rabbitmq_listener(app_ref: FastAPI) -> None:
     loop = asyncio.get_running_loop()
     app_ref.state.rmq_event_queue = asyncio.Queue()
     app_ref.state.rmq_stop_event = threading.Event()
+    # Readiness flag for RabbitMQ listener
+    app_ref.state.rmq_connected = False
 
     def rmq_thread() -> None:
         host = os.getenv("RABBITMQ_HOST", "localhost")
@@ -279,6 +305,11 @@ async def _start_rabbitmq_listener(app_ref: FastAPI) -> None:
             try:
                 connection = pika.BlockingConnection(params)
                 channel = connection.channel()
+                # Connection established: mark RMQ as connected for readiness
+                try:
+                    app_ref.state.rmq_connected = True
+                except Exception:
+                    pass
                 channel.exchange_declare(exchange=exchange_name, exchange_type="fanout", durable=True)
                 res = channel.queue_declare(queue="", exclusive=True, auto_delete=True)
                 qname = res.method.queue
@@ -308,6 +339,11 @@ async def _start_rabbitmq_listener(app_ref: FastAPI) -> None:
                     pass
             except Exception as e:
                 logger.error("RabbitMQ listener error: %s (reconnecting soon)", str(e))
+                # Mark as not connected for readiness
+                try:
+                    app_ref.state.rmq_connected = False
+                except Exception:
+                    pass
                 # Backoff a bit before retrying
                 app_ref.state.rmq_stop_event.wait(1.0)
 
@@ -508,6 +544,77 @@ def fragment_date_range_by_months(start_date: date, end_date: date, months_per_f
 # ----------------------
 # REST Endpoints
 # ----------------------
+
+# Collector control publisher helper
+
+def _publish_collector_control(command: Literal["pause", "resume"]) -> None:
+    """Publish a pause/resume command to the 'collector_control' fanout exchange."""
+    rmq_host = os.getenv("RABBITMQ_HOST", "localhost")
+    rmq_port = int(os.getenv("RABBITMQ_PORT", "5672"))
+    rmq_user = os.getenv("RABBITMQ_USER", "guest")
+    rmq_password = os.getenv("RABBITMQ_PASSWORD", "guest")
+    exchange_name = os.getenv("RABBITMQ_COLLECTOR_CONTROL_EXCHANGE", "collector_control")
+
+    creds = pika.PlainCredentials(rmq_user, rmq_password)
+    params = pika.ConnectionParameters(
+        host=rmq_host,
+        port=rmq_port,
+        credentials=creds,
+        heartbeat=int(os.getenv("RABBITMQ_HEARTBEAT", "30")),
+        blocked_connection_timeout=int(os.getenv("RABBITMQ_BLOCKED_TIMEOUT", "60")),
+        connection_attempts=1,
+        retry_delay=0,
+        client_properties={"connection_name": "api-service-collector-control-publisher"},
+    )
+
+    conn: Optional[pika.BlockingConnection] = None
+    ch: Optional[pika.adapters.blocking_connection.BlockingChannel] = None
+    try:
+        conn = pika.BlockingConnection(params)
+        ch = conn.channel()
+        # Ensure fanout exchange exists
+        ch.exchange_declare(exchange=exchange_name, exchange_type="fanout", durable=True)
+        body = json.dumps({"command": command}, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        props = pika.BasicProperties(content_type="application/json", delivery_mode=2)
+        ch.basic_publish(exchange=exchange_name, routing_key="", body=body, properties=props, mandatory=False)
+    finally:
+        try:
+            if ch:
+                ch.close()
+        except Exception:
+            pass
+        try:
+            if conn and not conn.is_closed:
+                conn.close()
+        except Exception:
+            pass
+
+
+@app.post("/v1/collectors/pause", status_code=status.HTTP_202_ACCEPTED)
+async def pause_collectors(_: bool = Depends(require_api_key)):
+    """Pause live collectors by broadcasting a control message."""
+    try:
+        _publish_collector_control("pause")
+        return {"status": "ok", "command": "pause"}
+    except Exception as e:
+        logger.exception("Failed to publish pause command")
+        raise HTTPException(status_code=503, detail=f"Failed to publish pause command: {str(e)}")
+
+
+@app.post("/v1/collectors/resume", status_code=status.HTTP_202_ACCEPTED)
+async def resume_collectors():
+    """Resume live collectors by broadcasting a control message.
+
+    Note: This endpoint is intentionally not protected to support sendBeacon() from the admin UI.
+    """
+    try:
+        _publish_collector_control("resume")
+        return {"status": "ok", "command": "resume"}
+    except Exception as e:
+        logger.exception("Failed to publish resume command")
+        raise HTTPException(status_code=503, detail=f"Failed to publish resume command: {str(e)}")
+
+
 @app.post("/v1/backfill/jobs", status_code=status.HTTP_202_ACCEPTED)
 async def create_backfill_job(job: BackfillJobRequest = Body(...), _: bool = Depends(require_api_key)):
     """Create a backfill master job with intelligent coverage planning.

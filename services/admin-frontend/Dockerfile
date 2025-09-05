@@ -16,6 +16,9 @@ COPY index.html style.css script.js ./
 # Stage 2: Production stage with nginx
 FROM nginx:1.25-alpine
 
+# Install curl for healthchecks
+RUN apk add --no-cache curl
+
 # Remove default nginx website
 RUN rm -rf /usr/share/nginx/html/*
 
